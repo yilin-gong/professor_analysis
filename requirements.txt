@@ -2,9 +2,5 @@ requests
 beautifulsoup4
 pandas
 openai
-<<<<<<< codex/ensure-newline-at-end-of-requirements.txt
-streamlit 
-=======
 streamlit
 playwright
->>>>>>> main
