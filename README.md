@@ -6,6 +6,7 @@
 
 1. **网站分析**：自动爬取大学网站，识别教授页面并提取其研究兴趣
 2. **兴趣匹配**：将您的研究兴趣与找到的教授研究兴趣进行比较，计算相似度分数
+3. **翻页检测**：自动识别并跟随“下一页”链接，获取更多页面链接
 
 ## 安装
 
@@ -36,10 +37,10 @@
 您也可以使用命令行版本：
 
 ```
-python main.py 网站URL [--max-links 链接数量] [--workers 线程数] [--output 输出文件名]
+python main.py 网站URL [--max-links 链接数量] [--max-pages 翻页数量] [--workers 线程数] [--output 输出文件名]
 ```
 
 例如：
 ```
-python main.py https://journalism.uiowa.edu/people --max-links 500 --workers 5
-``` 
+python main.py https://journalism.uiowa.edu/people --max-links 500 --max-pages 3 --workers 5
+```
