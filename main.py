@@ -12,6 +12,7 @@ from urllib3.util.retry import Retry
 import re
 from typing import Dict, List, Tuple, Optional, Union
 import json
+import argparse
 
 # Set up logging
 logging.basicConfig(
@@ -685,63 +686,93 @@ def calculate_link_score(anchor, href, page_structure, base_url):
     # 检测页面类型 - 学术机构特殊处理
     is_academic_page = detect_academic_page_type(base_url, page_structure)
     
-    # 教授相关关键词匹配 (最高4分)
+    # 教授相关关键词匹配 (最高4分) - 扩展关键词列表
     professor_keywords = [
         "faculty", "professor", "staff", "people", "members", 
         "researchers", "team", "dr.", "ph.d", "phd", "associate professor",
-        "assistant professor", "clinical professor", "emeritus"
+        "assistant professor", "clinical professor", "emeritus", "lecturer",
+        "instructor", "scholar", "academic", "researcher", "scientist",
+        "chair", "director", "dean", "postdoc", "fellow"
     ]
-    strong_keywords = ["professor", "faculty", "dr.", "ph.d"]
+    strong_keywords = ["professor", "faculty", "dr.", "ph.d", "phd", "scholar"]
     
     keyword_matches = sum(1 for kw in professor_keywords if kw in anchor_text)
     strong_matches = sum(1 for kw in strong_keywords if kw in anchor_text)
     
     score += min(keyword_matches * 0.5 + strong_matches, 4)
     
-    # URL路径分析 (最高3分)
-    url_keywords = ["faculty", "professor", "people", "staff", "members", "user"]
+    # URL路径分析 (最高4分) - 扩展URL模式识别
+    url_keywords = ["faculty", "professor", "people", "staff", "members", "user", "profile", "directory"]
+    academic_paths = ["/faculty/", "/people/", "/staff/", "/directory/", "/profiles/", "/bio/", "/academic/"]
+    
+    # 基础URL关键词匹配
     if any(kw in href.lower() for kw in url_keywords):
         score += 2
+    
+    # 学术路径模式匹配
+    if any(path in href.lower() for path in academic_paths):
+        score += 1
         
-    # 特殊处理：个人页面模式 (如 /user/数字, /people/name)
-    if re.search(r'/user/\d+$', href):
-        score += 3  # 这很可能是个人页面
-    elif re.search(r'/people/[a-z\-]+$', href.lower()):
-        score += 3  # NYU Steinhardt类型的个人页面
-        
+    # 特殊处理：个人页面模式识别 (更通用的模式)
+    # 模式1: /user/数字 或 /profile/数字
+    if re.search(r'/(user|profile|member)/\d+/?$', href):
+        score += 3
+    # 模式2: /people/name 或 /faculty/name
+    elif re.search(r'/(people|faculty|staff|directory)/[a-zA-Z\-_]+/?$', href.lower()):
+        score += 3
+    # 模式3: 包含姓名的URL模式 (/firstname-lastname, /f.lastname等)
+    elif re.search(r'/[a-zA-Z]+[\-_\.][a-zA-Z]+(?:[\-_\.][a-zA-Z]+)*/?$', href):
+        # 检查是否像是人名模式
+        url_parts = href.split('/')[-1].replace('-', ' ').replace('_', ' ').replace('.', ' ')
+        if len(url_parts.split()) >= 2:  # 至少两个部分，可能是姓和名
+            score += 2
+    
     # 增强的人名识别 (支持更多格式)
     name_score = calculate_name_likelihood(original_anchor_text, is_academic_page)
     score += name_score
     
-    # 学术页面特殊加分
+    # 学术页面特殊加分 - 更灵活的识别
     if is_academic_page:
         # 在学术页面中，简单的人名链接应该得到更高分数
-        if len(anchor_text.split()) == 2 and not any(kw in anchor_text for kw in professor_keywords):
+        words = anchor_text.split()
+        if (len(words) == 2 and 
+            not any(kw in anchor_text for kw in professor_keywords) and
+            all(len(word) > 1 for word in words)):  # 确保不是缩写
             # 可能是纯人名链接
             score += 2
             logger.debug(f"Academic page name bonus: {original_anchor_text} -> +2")
+        
+        # 如果链接文本包含学位信息，额外加分
+        if re.search(r'\b(ph\.?d\.?|m\.?d\.?|m\.?s\.?|m\.?a\.?|b\.?a\.?|b\.?s\.?)\b', anchor_text, re.I):
+            score += 1
+            logger.debug(f"Degree information bonus: {original_anchor_text} -> +1")
     
-    # 页面位置分析 (扣分机制) - 降低扣分力度
+    # 页面位置分析 (扣分机制) - 保持较低扣分
     if is_link_in_non_content_area(anchor, page_structure):
-        score -= 1  # 减少扣分，从3分降到1分
+        score -= 1  # 轻微扣分，因为有些学校的教授链接可能在导航区
     
-    # 黑名单关键词 (扣分)
+    # 黑名单关键词 (扣分) - 更精确的过滤
     blacklist_keywords = [
         'home', 'about us', 'contact us', 'news', 'events', 'login', 'search',
         'admin', 'privacy', 'terms', 'cookie', 'sitemap', 'rss', 'subscribe',
-        'programs', 'admissions', 'tuition', 'apply'  # 添加一些学术网站常见的非教授链接
+        'programs', 'admissions', 'tuition', 'apply', 'campus', 'library',
+        'calendar', 'alumni', 'give', 'donate', 'career', 'job'
     ]
-    if any(kw in anchor_text for kw in blacklist_keywords):
-        score -= 2
+    blacklist_matches = sum(1 for kw in blacklist_keywords if kw in anchor_text)
+    if blacklist_matches > 0:
+        score -= min(blacklist_matches * 1.5, 3)  # 渐进式扣分
     
-    # URL模式过滤 (扣分)
-    bad_patterns = ['/admin/', '/login/', '/search/', '/api/', '/static/', '/css/', '/js/']
+    # URL模式过滤 (扣分) - 扩展不良模式
+    bad_patterns = [
+        '/admin/', '/login/', '/search/', '/api/', '/static/', '/css/', '/js/',
+        '/assets/', '/images/', '/downloads/', '/resources/', '/forms/', '/application/'
+    ]
     if any(pattern in href.lower() for pattern in bad_patterns):
         score -= 3
     
-    # 调试日志
-    if score > 3:  # 只记录有潜力的链接
-        logger.debug(f"Link scoring: '{original_anchor_text}' -> {href} = {score} points (academic: {is_academic_page})")
+    # 调试日志 - 提高日志质量
+    if score > 2:  # 降低日志阈值，记录更多潜在链接
+        logger.debug(f"Link scoring: '{original_anchor_text}' -> {href} = {score:.1f} points (academic: {is_academic_page})")
     
     # 确保分数在0-10范围内
     return max(0, min(10, score))
@@ -749,19 +780,61 @@ def calculate_link_score(anchor, href, page_structure, base_url):
 
 def detect_academic_page_type(base_url: str, page_structure: Dict) -> bool:
     """检测是否为学术机构页面"""
-    # URL模式检测
+    # URL模式检测 - 扩展支持更多学术机构
     academic_url_patterns = [
-        'steinhardt.nyu.edu', 'faculty', 'people', 'staff', 'edu/',
-        'university', 'college', 'school', 'department'
+        # 通用学术关键词
+        'faculty', 'people', 'staff', 'edu/', 'university', 'college', 'school', 'department',
+        'professor', 'academic', 'research', 'scholar',
+        
+        # 顶级域名
+        '.edu', '.ac.', 
+        
+        # 知名大学域名
+        'stanford.edu', 'harvard.edu', 'mit.edu', 'berkeley.edu', 'ucla.edu', 'columbia.edu',
+        'yale.edu', 'princeton.edu', 'uchicago.edu', 'upenn.edu', 'cornell.edu', 'brown.edu',
+        'dartmouth.edu', 'duke.edu', 'northwestern.edu', 'vanderbilt.edu', 'rice.edu',
+        'emory.edu', 'georgetown.edu', 'cmu.edu', 'caltech.edu', 'nyu.edu', 'steinhardt.nyu.edu',
+        'asc.upenn.edu', 'wharton.upenn.edu', 'seas.upenn.edu',
+        
+        # 州立大学系统
+        'uc.edu', 'csu.edu', 'suny.edu', 'cuny.edu', 'ufl.edu', 'fsu.edu', 'uf.edu',
+        'umich.edu', 'msu.edu', 'osu.edu', 'psu.edu', 'rutgers.edu', 'umd.edu', 'vt.edu',
+        'unc.edu', 'ncsu.edu', 'clemson.edu', 'sc.edu', 'uga.edu', 'gsu.edu', 'fiu.edu',
+        'ucf.edu', 'usf.edu', 'famu.edu', 'fgcu.edu', 'nova.edu', 'barry.edu', 'lynn.edu',
+        
+        # 国际大学
+        'ox.ac.uk', 'cam.ac.uk', 'imperial.ac.uk', 'ucl.ac.uk', 'kcl.ac.uk', 'lse.ac.uk',
+        'ed.ac.uk', 'manchester.ac.uk', 'bristol.ac.uk', 'warwick.ac.uk', 'bath.ac.uk',
+        'utoronto.ca', 'ubc.ca', 'mcgill.ca', 'sfu.ca', 'uvic.ca', 'ualberta.ca',
+        'anu.edu.au', 'unsw.edu.au', 'sydney.edu.au', 'melbourne.edu.au', 'monash.edu.au',
+        'nus.edu.sg', 'ntu.edu.sg', 'hku.hk', 'cuhk.edu.hk', 'ust.hk',
+        
+        # 社区学院和其他教育机构
+        'cc.edu', 'edu.', 'academic', 'institute', 'consortium'
     ]
     
-    if any(pattern in base_url.lower() for pattern in academic_url_patterns):
+    # 检查URL是否匹配学术模式
+    url_lower = base_url.lower()
+    if any(pattern in url_lower for pattern in academic_url_patterns):
         return True
     
     # 页面结构检测 - 查找学术相关元素
     if page_structure:
-        # 这里可以添加更多页面结构检测逻辑
-        pass
+        # 检查页面是否包含学术相关的结构元素
+        academic_indicators = []
+        
+        # 检查导航和内容区域是否包含学术关键词
+        for area_name in ['navigation_elements', 'content_elements']:
+            for element in page_structure.get(area_name, []):
+                if element:
+                    text = element.get_text().lower()
+                    if any(keyword in text for keyword in ['faculty', 'professor', 'research', 'academic', 'department', 'college']):
+                        academic_indicators.append(area_name)
+                        break
+        
+        # 如果多个区域都包含学术关键词，认为是学术页面
+        if len(academic_indicators) >= 2:
+            return True
     
     return False
 
@@ -1082,36 +1155,68 @@ def analyze_page_characteristics(soup: BeautifulSoup, url: str) -> Dict[str, any
         'content_depth': 'shallow'
     }
     
-    # 分析URL路径，判断页面类型
-    if any(keyword in url.lower() for keyword in ['/faculty', '/people', '/staff']):
-        if 'department' in url.lower() or len(url.split('/')) > 5:
+    # 分析URL路径，判断页面类型 - 扩展支持更多学校
+    url_lower = url.lower()
+    
+    # 检查是否为教师/教授页面
+    if any(keyword in url_lower for keyword in ['/faculty', '/people', '/staff', '/directory', '/profiles']):
+        # 进一步细分页面类型
+        if any(dept_keyword in url_lower for dept_keyword in ['department', 'dept', 'division', 'program']):
             analysis['page_type'] = 'department'  # 系级页面
-        elif 'college' in url.lower() or 'school' in url.lower():
+        elif any(college_keyword in url_lower for college_keyword in ['college', 'school', 'institute']):
             analysis['page_type'] = 'college'     # 学院级页面
+        elif 'graduate' in url_lower or 'phd' in url_lower:
+            analysis['page_type'] = 'graduate_faculty'  # 研究生院教师
         else:
             analysis['page_type'] = 'faculty_list'  # 通用教授列表
     
-    # 特殊检测NYU Steinhardt类型页面
-    if 'steinhardt.nyu.edu' in url.lower() and 'faculty' in url.lower():
-        analysis['page_type'] = 'nyu_steinhardt'
-        analysis['estimated_scale'] = 'large'
+    # 特殊检测知名学校页面类型
+    special_patterns = {
+        'steinhardt.nyu.edu': 'nyu_steinhardt',
+        'asc.upenn.edu': 'upenn_annenberg',
+        'seas.upenn.edu': 'upenn_engineering',
+        'wharton.upenn.edu': 'upenn_wharton',
+        'harvard.edu': 'harvard',
+        'mit.edu': 'mit',
+        'stanford.edu': 'stanford',
+        'berkeley.edu': 'uc_berkeley',
+        'columbia.edu': 'columbia'
+    }
     
-    # 检测搜索和过滤功能
-    filter_indicators = soup.find_all(['select', 'input', 'form'])
-    analysis['has_search_filters'] = len(filter_indicators) > 2
+    for pattern, page_type in special_patterns.items():
+        if pattern in url_lower and 'faculty' in url_lower:
+            analysis['page_type'] = page_type
+            analysis['estimated_scale'] = 'large'  # 知名大学通常规模较大
+            break
+    
+    # 检测搜索和过滤功能 - 更精确的检测
+    search_indicators = soup.find_all(['input', 'select', 'form', 'button'])
+    filter_forms = [elem for elem in search_indicators if 
+                   any(keyword in elem.get('class', []) + [elem.get('id', '')] + [elem.get('name', '')] 
+                       for keyword in ['search', 'filter', 'sort', 'category', 'department'])]
+    analysis['has_search_filters'] = len(filter_forms) > 1
     
     # 统计链接总数
     all_links = soup.find_all('a', href=True)
     analysis['total_links'] = len(all_links)
     
-    # 评估内容深度
+    # 评估内容深度 - 更准确的评估
     text_content = soup.get_text()
-    if len(text_content) > 10000:
+    content_length = len(text_content)
+    
+    # 计算教授相关内容的密度
+    professor_keywords = ['professor', 'faculty', 'ph.d', 'phd', 'dr.', 'research', 'department']
+    professor_mentions = sum(text_content.lower().count(keyword) for keyword in professor_keywords)
+    
+    if content_length > 15000 or professor_mentions > 20:
         analysis['content_depth'] = 'deep'
-    elif len(text_content) > 3000:
+        analysis['estimated_scale'] = 'large'
+    elif content_length > 5000 or professor_mentions > 10:
         analysis['content_depth'] = 'medium'
     else:
         analysis['content_depth'] = 'shallow'
+        if analysis['page_type'] != 'unknown':
+            analysis['estimated_scale'] = 'small'
     
     return analysis
 
@@ -1141,16 +1246,29 @@ def analyze_pagination_structure(soup: BeautifulSoup, url: str) -> Dict[str, any
     if pagination_elements:
         pagination_info['has_pagination'] = True
         
-        # 尝试找到页码数字
+        # 尝试找到页码数字 - 改进过滤逻辑
         page_numbers = []
         for element in pagination_elements:
-            # 查找数字
-            numbers = re.findall(r'\b\d+\b', element.get_text())
-            page_numbers.extend([int(n) for n in numbers if int(n) > 1])
+            # 查找数字，但要过滤掉无关数字
+            text_content = element.get_text()
+            numbers = re.findall(r'\b\d+\b', text_content)
+            
+            for num_str in numbers:
+                num = int(num_str)
+                # 过滤条件：
+                # - 大于1（页码从2开始有意义）
+                # - 小于1000（页码不太可能超过1000）
+                # - 不是常见的邮政编码模式（5位数）
+                # - 不是年份（1900-2100）
+                if (1 < num < 1000 and 
+                    not (10000 <= num <= 99999) and  # 5位邮政编码
+                    not (1900 <= num <= 2100)):  # 年份
+                    page_numbers.append(num)
         
         if page_numbers:
             pagination_info['estimated_total_pages'] = max(page_numbers)
             pagination_info['pagination_type'] = 'numbered'
+            logger.info(f"检测到分页: {max(page_numbers)} 页")
         else:
             # 检查是否有"下一页"类型的分页
             next_indicators = ['next', 'more', '>', '»', '下一页']
@@ -1279,20 +1397,68 @@ def clean_faculty_url(url: str) -> str:
     # 解析URL
     parsed = urllib.parse.urlparse(url)
     
-    # 特殊处理NYU Steinhardt类型的URL
-    if 'steinhardt.nyu.edu' in parsed.netloc and 'faculty' in parsed.path:
+    # 特殊处理各种学校的URL模式
+    special_cleaning_patterns = [
+        # NYU系列
+        'steinhardt.nyu.edu',
+        'nyu.edu',
+        # 宾夕法尼亚大学系列
+        'upenn.edu',
+        'asc.upenn.edu',
+        'wharton.upenn.edu',
+        'seas.upenn.edu',
+        # 其他知名大学
+        'harvard.edu',
+        'mit.edu',
+        'stanford.edu',
+        'berkeley.edu',
+        'columbia.edu',
+        'yale.edu',
+        'princeton.edu'
+    ]
+    
+    # 检查是否为需要特殊处理的学校
+    needs_cleaning = any(pattern in parsed.netloc for pattern in special_cleaning_patterns)
+    
+    if needs_cleaning and any(keyword in parsed.path for keyword in ['faculty', 'people', 'staff', 'directory']):
         # 去除查询参数，保留基础的faculty页面
         clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-        if clean_url.endswith('faculty'):
-            return clean_url
-        # 如果URL包含其他路径，保留到faculty为止
-        path_parts = parsed.path.split('/')
-        try:
-            faculty_index = path_parts.index('faculty')
-            clean_path = '/'.join(path_parts[:faculty_index+1])
-            return f"{parsed.scheme}://{parsed.netloc}{clean_path}"
-        except ValueError:
-            pass
+        
+        # 对于带有筛选参数的URL，尝试简化到基础路径
+        if parsed.query:
+            # 检查路径是否以这些关键词结尾
+            faculty_endpoints = ['faculty', 'people', 'staff', 'directory', 'profiles']
+            
+            for endpoint in faculty_endpoints:
+                if clean_url.endswith(endpoint):
+                    return clean_url
+                    
+            # 如果URL包含这些路径，保留到这些路径为止
+            path_parts = parsed.path.split('/')
+            for i, part in enumerate(path_parts):
+                if part in faculty_endpoints:
+                    clean_path = '/'.join(path_parts[:i+1])
+                    return f"{parsed.scheme}://{parsed.netloc}{clean_path}"
+        
+        return clean_url
+    
+    # 对于其他URL，只是去除明显的筛选参数
+    if parsed.query:
+        # 保留重要的查询参数，去除筛选参数
+        query_params = urllib.parse.parse_qs(parsed.query)
+        important_params = {}
+        
+        # 保留这些参数，因为它们可能是页面结构的一部分
+        preserve_params = ['page', 'p', 'dept', 'department', 'college', 'school']
+        for param in preserve_params:
+            if param in query_params:
+                important_params[param] = query_params[param]
+        
+        if important_params:
+            new_query = urllib.parse.urlencode(important_params, doseq=True)
+            return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{new_query}"
+        else:
+            return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
     
     return url
 
@@ -1476,15 +1642,145 @@ def test_nyu_steinhardt_fixes():
     logger.info("✅ NYU Steinhardt修复测试完成")
 
 
+def test_multi_university_compatibility():
+    """测试多个大学的兼容性"""
+    logger.info("🌍 测试多学校兼容性...")
+    
+    # 测试用的大学URL列表
+    test_universities = [
+        {
+            'name': '宾夕法尼亚大学传播学院',
+            'url': 'https://www.asc.upenn.edu/people/faculty',
+            'expected_professors': 10
+        },
+        {
+            'name': 'NYU Steinhardt',
+            'url': 'https://steinhardt.nyu.edu/about/faculty',
+            'expected_professors': 25
+        },
+        {
+            'name': '爱荷华大学新闻学院',
+            'url': 'https://journalism.uiowa.edu/people',
+            'expected_professors': 15
+        },
+        {
+            'name': '哥伦比亚大学新闻学院',
+            'url': 'https://journalism.columbia.edu/faculty',
+            'expected_professors': 20
+        },
+        {
+            'name': '斯坦福大学传播系',
+            'url': 'https://comm.stanford.edu/people/faculty',
+            'expected_professors': 15
+        }
+    ]
+    
+    session = create_session()
+    results = []
+    
+    for university in test_universities:
+        try:
+            logger.info(f"📊 测试 {university['name']}...")
+            
+            # 测试页面访问
+            try:
+                response = session.get(university['url'], timeout=10, headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                })
+                page_accessible = response.status_code == 200
+                page_size = len(response.text) if page_accessible else 0
+            except Exception:
+                page_accessible = False
+                page_size = 0
+            
+            # 如果页面可访问，测试智能参数推荐
+            if page_accessible:
+                try:
+                    recommendations = intelligent_parameter_estimation(university['url'], session)
+                    
+                    # 测试链接提取
+                    links = get_all_links(university['url'], session, follow_pagination=False, max_pages=1)
+                    
+                    # 统计教授相关链接
+                    professor_links = []
+                    for link in links:
+                        if any(pattern in link.lower() for pattern in ['/faculty/', '/people/', '/profile', 'professor']):
+                            professor_links.append(link)
+                    
+                    result = {
+                        'university': university['name'],
+                        'url': university['url'],
+                        'page_accessible': True,
+                        'page_size': page_size,
+                        'recommended_max_links': recommendations['max_links'],
+                        'recommended_max_pages': recommendations['max_pages'],
+                        'page_type': recommendations.get('page_type', 'unknown'),
+                        'professor_density': recommendations.get('professor_density', 0),
+                        'total_links_found': len(links),
+                        'professor_links_found': len(professor_links),
+                        'expected_professors': university['expected_professors'],
+                        'success_rate': len(professor_links) / university['expected_professors'] if university['expected_professors'] > 0 else 0
+                    }
+                    
+                except Exception as e:
+                    result = {
+                        'university': university['name'],
+                        'url': university['url'],
+                        'page_accessible': True,
+                        'page_size': page_size,
+                        'error': str(e)
+                    }
+            else:
+                result = {
+                    'university': university['name'],
+                    'url': university['url'],
+                    'page_accessible': False,
+                    'error': 'Page not accessible'
+                }
+            
+            results.append(result)
+            logger.info(f"✅ {university['name']} 测试完成")
+            
+        except Exception as e:
+            logger.error(f"❌ {university['name']} 测试失败: {e}")
+            results.append({
+                'university': university['name'],
+                'url': university['url'],
+                'error': f'Test failed: {str(e)}'
+            })
+    
+    # 输出测试结果摘要
+    logger.info("📋 多学校测试结果摘要:")
+    logger.info("=" * 60)
+    
+    accessible_count = sum(1 for r in results if r.get('page_accessible', False))
+    total_count = len(results)
+    
+    logger.info(f"页面可访问性: {accessible_count}/{total_count} ({accessible_count/total_count:.1%})")
+    
+    for result in results:
+        if result.get('page_accessible'):
+            logger.info(f"✅ {result['university']}")
+            logger.info(f"   页面类型: {result.get('page_type', 'unknown')}")
+            logger.info(f"   教授密度: {result.get('professor_density', 0):.1%}")
+            logger.info(f"   推荐参数: {result.get('recommended_max_links', 'N/A')} 链接, {result.get('recommended_max_pages', 'N/A')} 页面")
+            logger.info(f"   找到链接: {result.get('total_links_found', 0)} 总计, {result.get('professor_links_found', 0)} 教授")
+            if 'success_rate' in result:
+                logger.info(f"   成功率: {result['success_rate']:.1%}")
+        else:
+            logger.info(f"❌ {result['university']}: {result.get('error', 'Unknown error')}")
+        logger.info("")
+    
+    return results
+
+
 # Example usage
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser(
         description="Analyze a website to find professor pages and research interests."
     )
-    parser.add_argument("url", help="Starting URL to analyze")
-    parser.add_argument("--api-key", required=True, help="API key for OpenAI services")
+    parser.add_argument("url", nargs='?', help="Starting URL to analyze")
+    parser.add_argument("--api-key", help="API key for OpenAI services")
     parser.add_argument(
         "--max-links", type=int, default=30, help="Maximum number of links to analyze"
     )
@@ -1503,12 +1799,26 @@ if __name__ == "__main__":
     parser.add_argument(
         "--test-fixes", action="store_true", help="Test NYU Steinhardt fixes"
     )
+    parser.add_argument(
+        "--test-multi-university", action="store_true", help="Test multi-university compatibility"
+    )
     args = parser.parse_args()
     
     # 如果是测试模式，运行测试并退出
     if args.test_fixes:
         test_nyu_steinhardt_fixes()
         exit(0)
+    
+    # 如果是多学校测试模式，运行多学校测试并退出
+    if args.test_multi_university:
+        test_multi_university_compatibility()
+        exit(0)
+
+    # 对于正常运行模式，检查必需参数
+    if not args.url:
+        parser.error("URL is required for normal analysis mode")
+    if not args.api_key:
+        parser.error("API key is required for normal analysis mode")
 
     # Run the analysis
     results_df = analyze_webpage_links(
