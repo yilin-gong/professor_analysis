@@ -363,83 +363,116 @@ def get_research_interests(url, session=None, client=None):
         response = robust_web_request(session, url)
         soup = BeautifulSoup(response.text, "html.parser")
 
-        # Get title
+        # Get title and meta information
         title = soup.title.string if soup.title else ""
+        meta_desc = ""
+        meta_tag = soup.find("meta", attrs={"name": "description"})
+        if meta_tag and "content" in meta_tag.attrs:
+            meta_desc = meta_tag["content"]
 
-        # Extract text content
+        # Extract all text content and remove scripts/styles
         for script in soup(["script", "style"]):
             script.extract()
 
-        # Try to find research-specific sections
+        # 1. 提取主要标题信息
+        main_heading = ""
+        h1_tag = soup.find("h1")
+        if h1_tag:
+            main_heading = h1_tag.get_text(strip=True)
+
+        # 2. 提取所有段落内容
+        paragraphs = []
+        for p in soup.find_all("p"):
+            text = p.get_text(strip=True)
+            if len(text) > 20:  # 过滤过短的段落
+                paragraphs.append(text)
+
+        # 3. 查找研究相关的特定区域
         research_sections = []
         research_keywords = [
-            "research",
-            "interests",
-            "projects",
-            "expertise",
-            "publications",
+            "research", "interests", "projects", "expertise", "publications",
+            "areas", "focus", "specialty", "work", "studies", "investigation"
         ]
 
         # Look for sections with research-related headers
-        for header in soup.find_all(["h1", "h2", "h3", "h4"]):
+        for header in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
             header_text = header.get_text(strip=True).lower()
             if any(keyword in header_text for keyword in research_keywords):
                 section_content = []
-                # Collect paragraphs until the next header
+                
+                # 收集该标题下的内容，直到下一个同级或更高级标题
+                current_level = int(header.name[1])  # h1=1, h2=2, etc.
+                
                 for sibling in header.find_next_siblings():
-                    if sibling.name in ["h1", "h2", "h3", "h4"]:
+                    if (sibling.name and sibling.name.startswith('h') and 
+                        int(sibling.name[1]) <= current_level):
                         break
-                    if sibling.name in ["p", "ul", "ol", "div"]:
-                        section_content.append(sibling.get_text(strip=True))
+                    if sibling.name in ["p", "ul", "ol", "div", "section"]:
+                        content = sibling.get_text(strip=True)
+                        if len(content) > 10:
+                            section_content.append(content)
 
                 if section_content:
-                    research_sections.append(
-                        {"header": header_text, "content": " ".join(section_content)}
-                    )
+                    research_sections.append({
+                        "header": header_text,
+                        "content": " ".join(section_content)
+                    })
 
-        # Combine all found sections
-        research_content = ""
-        if research_sections:
-            research_content = "\n\n".join(
-                f"{section['header']}: {section['content'][:500]}"
-                for section in research_sections
-            )
-        else:
-            # If no specific research sections found, use general page content
-            research_content = soup.get_text(separator=" ", strip=True)[:3000]
+        # 4. 提取列表信息（可能包含研究领域）
+        list_items = []
+        for ul in soup.find_all(["ul", "ol"]):
+            items = []
+            for li in ul.find_all("li"):
+                item_text = li.get_text(strip=True)
+                if len(item_text) > 5:
+                    items.append(item_text)
+            if items and len(" ".join(items)) < 1000:  # 避免过长的列表
+                list_items.extend(items)
 
-        # 查找相关链接并获取额外信息
+        # 5. 查找相关链接并获取额外信息
         related_links = find_related_professor_links(url, session)
         additional_info = integrate_professor_info(url, related_links, session, client)
-        
-        # 构建完整的研究内容，包含额外信息
-        full_research_content = research_content
-        if additional_info.get('additional_research_info'):
-            full_research_content += f"\n\n额外研究信息: {additional_info['additional_research_info'][:1000]}"
-        if additional_info.get('publications_info'):
-            full_research_content += f"\n\n出版物信息: {additional_info['publications_info'][:1000]}"
+
+        # 6. 构建全面的分析内容
+        comprehensive_content = {
+            "page_title": title,
+            "meta_description": meta_desc,
+            "main_heading": main_heading,
+            "research_sections": research_sections,
+            "key_paragraphs": paragraphs[:10],  # 限制段落数量
+            "relevant_lists": list_items[:20],   # 限制列表项数量
+            "additional_cv_info": additional_info.get('cv_info', ''),
+            "additional_publications": additional_info.get('publications_info', ''),
+            "additional_research": additional_info.get('additional_research_info', '')
+        }
+
+        # 7. 构建给LLM的综合提示词
+        analysis_prompt = _build_comprehensive_analysis_prompt(comprehensive_content)
 
         # Ask LLM to extract research interests and keywords
         response_text = robust_llm_call(client, [
             {
                 "role": "system",
-                "content": """你是一个专业的学术信息提取专家。你的任务是从教授的网页内容中提取研究兴趣和关键词。
+                "content": """你是一个专业的学术信息提取专家。你的任务是从教授的网页内容中综合分析并提取研究兴趣和关键词。
 
 请返回JSON格式的结果：
 {
-    "research_interests": "清洁的研究兴趣描述",
+    "research_interests": "清洁简洁的研究兴趣描述",
     "keywords": ["关键词1", "关键词2", "关键词3"]
 }
 
-要求：
-1. 研究兴趣应该只包含具体的研究内容，不要包含"该教授的研究兴趣是"等描述性语言
-2. 不要使用粗体、斜体等格式化标记
-3. 关键词应该是3-10个最重要的研究领域术语
-4. 关键词应该按重要性排序""",
+分析要求：
+1. 研究兴趣描述应该综合所有提供的信息，包括页面标题、研究区域、出版物信息等
+2. 不要包含"该教授的研究兴趣是"等描述性语言，直接描述研究内容
+3. 不要使用格式化标记（粗体、斜体等）
+4. 关键词应该是5-10个最重要的研究领域术语
+5. 关键词应该按重要性排序
+6. 优先关注研究专业术语和方法论
+7. 如果有多个研究领域，应该都涵盖到""",
             },
             {
                 "role": "user",
-                "content": f"请分析以下教授网页内容，提取研究兴趣和关键词：\n\n页面标题: {title}\n\n内容:\n{full_research_content}",
+                "content": analysis_prompt,
             },
         ])
 
@@ -485,6 +518,44 @@ def get_research_interests(url, session=None, client=None):
         }
 
 
+def _build_comprehensive_analysis_prompt(content_dict):
+    """构建综合分析提示词"""
+    prompt_parts = []
+    
+    prompt_parts.append("请综合分析以下教授网页的所有信息，提取研究兴趣和关键词：\n")
+    
+    if content_dict["page_title"]:
+        prompt_parts.append(f"页面标题: {content_dict['page_title']}")
+    
+    if content_dict["main_heading"]:
+        prompt_parts.append(f"主要标题: {content_dict['main_heading']}")
+    
+    if content_dict["meta_description"]:
+        prompt_parts.append(f"页面描述: {content_dict['meta_description']}")
+    
+    if content_dict["research_sections"]:
+        prompt_parts.append("\n研究相关区域:")
+        for section in content_dict["research_sections"]:
+            prompt_parts.append(f"- {section['header']}: {section['content'][:800]}")
+    
+    if content_dict["key_paragraphs"]:
+        prompt_parts.append(f"\n主要段落内容: {' '.join(content_dict['key_paragraphs'][:5])[:1500]}")
+    
+    if content_dict["relevant_lists"]:
+        prompt_parts.append(f"\n相关列表信息: {' | '.join(content_dict['relevant_lists'][:15])}")
+    
+    if content_dict["additional_cv_info"]:
+        prompt_parts.append(f"\nCV信息: {content_dict['additional_cv_info'][:800]}")
+    
+    if content_dict["additional_publications"]:
+        prompt_parts.append(f"\n出版物信息: {content_dict['additional_publications'][:800]}")
+    
+    if content_dict["additional_research"]:
+        prompt_parts.append(f"\n额外研究信息: {content_dict['additional_research'][:800]}")
+    
+    return "\n".join(prompt_parts)
+
+
 def process_link(link, session, client=None):
     """Process a single link - to be used with ThreadPoolExecutor."""
     logger.info(f"Analyzing: {link}")
@@ -495,6 +566,7 @@ def process_link(link, session, client=None):
     try:
         is_professor, prof_info = is_professor_webpage(link, session, client)
         if is_professor:
+            # 只有确认是教授个人网页才进行详细分析
             research_data = get_research_interests(link, session, client)
             return {
                 "URL": link,
@@ -508,30 +580,11 @@ def process_link(link, session, client=None):
                 "Confidence Score": prof_info.get("confidence", 0.0)
             }
         else:
-            return {
-                "URL": link,
-                "Professor Name": "",
-                "Title": "",
-                "Department": "",
-                "Is Professor Page": "No",
-                "Research Interests": "",
-                "Keywords": [],
-                "Additional URLs": [],
-                "Confidence Score": 0.0
-            }
+            # 非教授页面不返回结果，不在最终结果中列举
+            return None
     except Exception as e:
         logger.error(f"Error processing {link}: {e}")
-        return {
-            "URL": link,
-            "Professor Name": "",
-            "Title": "",
-            "Department": "",
-            "Is Professor Page": "Error",
-            "Research Interests": f"Error: {str(e)}",
-            "Keywords": [],
-            "Additional URLs": [],
-            "Confidence Score": 0.0
-        }
+        return None
 
 
 def analyze_webpage_links(start_url, api_key, max_links=50, max_workers=5, max_pages=3):
@@ -589,41 +642,30 @@ def analyze_webpage_links(start_url, api_key, max_links=50, max_workers=5, max_p
             link = future_to_link[future]
             try:
                 result = future.result()
-                if result:
+                if result:  # 只添加非None的结果（即教授页面）
                     results.append(result)
                     # Log professor pages as we find them
-                    if result["Is Professor Page"] == "Yes":
-                        logger.info(f"FOUND PROFESSOR PAGE: {link}")
-                        logger.info(
-                            f"Research Interests: {result['Research Interests']}"
-                        )
+                    logger.info(f"FOUND PROFESSOR PAGE: {link}")
+                    logger.info(
+                        f"Research Interests: {result['Research Interests']}"
+                    )
             except Exception as e:
                 logger.error(f"Exception processing {link}: {e}")
-                results.append(
-                    {
-                        "URL": link,
-                        "Is Professor Page": "Error",
-                        "Research Interests": f"Error: {str(e)}",
-                    }
-                )
+                # 错误情况也不再添加到结果中
 
     # Create DataFrame
     df = pd.DataFrame(results)
 
-    # Filter only professor pages if desired
-    professors_df = df[df["Is Professor Page"] == "Yes"]
-
     logger.info(
-        f"Analysis complete. Found {len(professors_df)} professor pages out of {len(results)} total links analyzed."
+        f"Analysis complete. Found {len(results)} professor pages out of {len(all_links)} total links analyzed."
     )
 
     # Print summary statistics
-    yes_count = sum(1 for r in results if r["Is Professor Page"] == "Yes")
-    no_count = sum(1 for r in results if r["Is Professor Page"] == "No")
-    error_count = sum(1 for r in results if r["Is Professor Page"] == "Error")
-
+    professor_count = len(results)  # 现在results中只包含教授页面
+    total_links = len(all_links)
+    
     logger.info(
-        f"Results Summary: {yes_count} professor pages, {no_count} non-professor pages, {error_count} errors"
+        f"Results Summary: {professor_count} professor pages found from {total_links} links analyzed"
     )
 
     return df
@@ -1530,7 +1572,7 @@ def adaptive_analysis_with_intelligent_params(
             deduplicated_results = []
             
             for result in all_results:
-                url = result.get('url', '')
+                url = result.get('URL', '')  # 修正字段名：URL而不是url
                 if url not in seen_urls:
                     seen_urls.add(url)
                     deduplicated_results.append(result)

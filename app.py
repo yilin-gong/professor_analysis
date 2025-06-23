@@ -14,6 +14,7 @@ import requests
 import re
 from bs4 import BeautifulSoup
 import logging
+import json
 
 # 设置日志
 logger = logging.getLogger(__name__)
@@ -31,46 +32,18 @@ if "similarity_results" not in st.session_state:
     st.session_state.similarity_results = None
 
 
-def render_keyword_tag(keyword: str) -> str:
-    """渲染主题自适应的关键词标签"""
-    # 使用CSS变量和更好的颜色方案，支持明亮和夜间主题
-    style = """
-    background-color: var(--background-color, rgba(59, 130, 246, 0.1)); 
-    color: var(--text-color, #1e40af); 
-    border: 1px solid var(--border-color, rgba(59, 130, 246, 0.3));
-    padding: 2px 8px; 
-    margin: 2px; 
-    border-radius: 12px; 
-    display: inline-block;
-    font-size: 0.85em;
-    font-weight: 500;
-    """
+def render_keyword_tag(keyword: str, highlight: bool = False) -> str:
+    """渲染关键词标签，支持高亮显示"""
+    base_style = "display: inline-block; margin: 2px; padding: 4px 8px; border-radius: 12px; font-size: 12px; font-weight: 500;"
     
-    # 添加CSS变量定义，适配不同主题
-    css_vars = """
-    <style>
-    :root {
-        --background-color: rgba(59, 130, 246, 0.1);
-        --text-color: #1e40af;
-        --border-color: rgba(59, 130, 246, 0.3);
-    }
-    @media (prefers-color-scheme: dark) {
-        :root {
-            --background-color: rgba(59, 130, 246, 0.2);
-            --text-color: #93c5fd;
-            --border-color: rgba(59, 130, 246, 0.4);
-        }
-    }
-    /* Streamlit夜间模式兼容 */
-    .stApp[data-theme="dark"] {
-        --background-color: rgba(59, 130, 246, 0.2);
-        --text-color: #93c5fd;
-        --border-color: rgba(59, 130, 246, 0.4);
-    }
-    </style>
-    """
+    if highlight:
+        # 匹配的关键词用高亮颜色
+        style = base_style + "background: linear-gradient(45deg, #FF6B6B, #4ECDC4); color: white; box-shadow: 0 2px 4px rgba(0,0,0,0.2);"
+    else:
+        # 普通关键词用灰色
+        style = base_style + "background: #f0f2f6; color: #262730; border: 1px solid #e6eaed;"
     
-    return f"{css_vars}<span style='{style}'>{keyword}</span>"
+    return f"<span style='{style}'>{keyword}</span>"
 
 
 def calculate_similarity(prof_interests, user_interests, api_key):
@@ -97,28 +70,208 @@ def calculate_similarity(prof_interests, user_interests, api_key):
         return f"分析相似度时出错: {str(e)}"
 
 
-def extract_similarity_score(similarity_text):
-    """从相似度文本中提取分数"""
+def extract_structured_similarity_data(similarity_text):
+    """从相似度分析文本中提取结构化数据"""
     try:
-        # 尝试查找数字模式，例如"相似度：85分"或"相似度分数：85/100"
-        matches = re.findall(r"(\d+)(?:/100|\s*分|\s*点)", similarity_text)
+        # 清理响应文本，移除可能的markdown标记
+        cleaned_text = similarity_text.strip()
+        if cleaned_text.startswith('```json'):
+            cleaned_text = cleaned_text[7:]
+        if cleaned_text.endswith('```'):
+            cleaned_text = cleaned_text[:-3]
+        cleaned_text = cleaned_text.strip()
+        
+        # 尝试解析JSON
+        try:
+            result = json.loads(cleaned_text)
+            
+            # 验证JSON结构
+            if validate_similarity_structure(result):
+                return {
+                    'success': True,
+                    'data': result,
+                    'overall_score': result.get('overall_similarity', 0),
+                    'dimension_scores': result.get('dimension_scores', {}),
+                    'matched_keywords': result.get('matched_keywords', []),
+                    'reasoning': result.get('reasoning', {}),
+                    'confidence': result.get('confidence', 0.5)
+                }
+        except json.JSONDecodeError:
+            pass
+        
+        # JSON解析失败，使用fallback机制
+        fallback_result = extract_fallback_similarity_data(similarity_text)
+        return {
+            'success': False,
+            'data': fallback_result,
+            'overall_score': fallback_result.get('overall_similarity', 0),
+            'dimension_scores': {},
+            'matched_keywords': [],
+            'reasoning': {'overall': similarity_text},
+            'confidence': 0.3
+        }
+        
+    except Exception as e:
+        # 出错时返回默认值
+        return {
+            'success': False,
+            'data': {},
+            'overall_score': 0,
+            'dimension_scores': {},
+            'matched_keywords': [],
+            'reasoning': {'overall': f'解析错误: {str(e)}'},
+            'confidence': 0.0
+        }
+
+
+def validate_similarity_structure(data):
+    """验证相似度分析结果的JSON结构是否正确"""
+    if not isinstance(data, dict):
+        return False
+    
+    required_keys = ['overall_similarity', 'dimension_scores', 'reasoning']
+    if not all(key in data for key in required_keys):
+        return False
+    
+    # 验证分数范围
+    overall = data.get('overall_similarity')
+    if not isinstance(overall, (int, float)) or not (0 <= overall <= 100):
+        return False
+    
+    # 验证维度分数
+    dimension_scores = data.get('dimension_scores', {})
+    if not isinstance(dimension_scores, dict):
+        return False
+    
+    expected_dimensions = ['research_topics', 'research_methods', 'theoretical_framework', 
+                          'application_domains', 'keyword_matching']
+    
+    for dim in expected_dimensions:
+        score = dimension_scores.get(dim)
+        if score is not None and (not isinstance(score, (int, float)) or not (0 <= score <= 100)):
+            return False
+    
+    # 验证置信度
+    confidence = data.get('confidence')
+    if confidence is not None and (not isinstance(confidence, (int, float)) or not (0 <= confidence <= 1)):
+        return False
+    
+    return True
+
+
+def extract_fallback_similarity_data(similarity_text):
+    """当JSON解析失败时的备用数据提取机制"""
+    import re
+    
+    # 尝试查找分数模式
+    score_patterns = [
+        r"相似度[：:]\s*(\d+)",
+        r"总体相似度[：:]\s*(\d+)",
+        r"overall_similarity[\"'\s]*[：:]\s*(\d+)",
+        r"(\d+)\s*分",
+        r"(\d+)/100"
+    ]
+    
+    extracted_score = 0
+    for pattern in score_patterns:
+        matches = re.findall(pattern, similarity_text, re.IGNORECASE)
         if matches:
-            return int(matches[0])
+            try:
+                score = int(matches[0])
+                if 0 <= score <= 100:
+                    extracted_score = score
+                    break
+            except ValueError:
+                continue
+    
+    # 如果没有找到有效分数，尝试提取所有数字并选择最合理的
+    if extracted_score == 0:
+        all_numbers = re.findall(r'\b(\d{1,3})\b', similarity_text)
+        valid_scores = [int(num) for num in all_numbers if 0 <= int(num) <= 100]
+        if valid_scores:
+            # 选择中位数作为最可能的分数
+            valid_scores.sort()
+            extracted_score = valid_scores[len(valid_scores) // 2]
+    
+    return {
+        'overall_similarity': extracted_score,
+        'dimension_scores': {},
+        'matched_keywords': [],
+        'reasoning': {'overall': similarity_text},
+        'confidence': 0.3
+    }
 
-        # 如果没有找到格式化的分数，尝试查找单独的数字
-        matches = re.findall(r"(?<!\d)\b(\d{1,3})\b(?!\d)", similarity_text)
-        if matches:
-            # 过滤掉不太可能是分数的数字（太小或太大）
-            possible_scores = [int(m) for m in matches if 0 <= int(m) <= 100]
-            if possible_scores:
-                return max(possible_scores)  # 返回最可能的分数
 
-        return 0  # 默认值
-    except Exception:
-        return 0  # 出错时返回默认值
+def calculate_advanced_similarity(prof_interests, prof_keywords, user_interests, api_key):
+    """使用LLM进行多维度研究兴趣相似度分析"""
+    try:
+        # 创建客户端
+        current_client = get_client(api_key)
 
+        # 处理教授关键词
+        keywords_str = ", ".join(prof_keywords) if prof_keywords and isinstance(prof_keywords, list) else "无关键词"
 
+        # 构建结构化提示词
+        system_prompt = """你是一个专业的学术匹配分析专家。你需要从多个维度分析教授的研究兴趣与用户研究兴趣的匹配度。
 
+请按照以下5个维度进行评分（每个维度0-100分）：
+
+1. **研究主题相似度**: 研究的核心话题、问题领域的重叠程度
+2. **研究方法匹配度**: 研究方法论、技术手段、分析工具的相似性  
+3. **理论框架重叠度**: 理论基础、学科背景、概念框架的契合度
+4. **应用领域契合度**: 实际应用场景、目标群体、解决问题的相似性
+5. **关键词精确匹配**: 具体术语、专业词汇的直接匹配程度
+
+请严格按照以下JSON格式返回结果：
+{
+    "overall_similarity": 整体相似度分数(0-100),
+    "dimension_scores": {
+        "research_topics": 研究主题分数(0-100),
+        "research_methods": 研究方法分数(0-100), 
+        "theoretical_framework": 理论框架分数(0-100),
+        "application_domains": 应用领域分数(0-100),
+        "keyword_matching": 关键词匹配分数(0-100)
+    },
+    "matched_keywords": ["匹配的关键词1", "匹配的关键词2"],
+    "reasoning": {
+        "strengths": "匹配优势的具体说明",
+        "gaps": "存在差距的具体分析", 
+        "overall": "综合评价和建议"
+    },
+    "confidence": 置信度(0.0-1.0)
+}
+
+注意：
+- 所有分数必须是0-100之间的整数
+- 整体相似度应该是各维度分数的加权平均
+- 置信度反映分析的可靠程度
+- 匹配关键词应从教授关键词中选择与用户兴趣相关的词汇"""
+
+        user_prompt = f"""请分析以下教授与用户的研究兴趣匹配度：
+
+**教授研究兴趣:**
+{prof_interests}
+
+**教授关键词:**  
+{keywords_str}
+
+**用户研究兴趣:**
+{user_interests}
+
+请按照要求的JSON格式进行多维度分析。"""
+
+        llm_response = current_client.chat.completions.create(
+            model="doubao-1-5-pro-32k-250115",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.1  # 降低温度以获得更一致的结果
+        )
+        
+        return llm_response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"多维度相似度分析时出错: {str(e)}"
 
 
 # 添加一个函数来显示结果，避免代码重复
@@ -172,110 +325,343 @@ def display_results(results_df):
 def display_professor_results(results: list, key_prefix: str = "default"):
     """显示教授分析结果"""
     if not results:
-        st.warning("⚠️ 没有结果可显示")
+        st.warning("⚠️ 没有找到教授页面")
         return
         
     # 转换为DataFrame
     df = pd.DataFrame(results)
     
-    # 分离教授页面和非教授页面
-    professor_results = [r for r in results if r.get('Is Professor Page') == 'Yes']
+    # 现在results中只包含教授页面，不需要过滤
+    professor_results = results
     
-    if professor_results:
-        st.subheader(f"👨‍🏫 找到的教授页面 ({len(professor_results)}位)")
-        
-        # 添加过滤和排序选项 - 使用动态key
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            confidence_filter = st.slider("最低置信度", 0.0, 1.0, 0.0, 0.1, key=f"confidence_filter_{key_prefix}")
-        with col2:
-            sort_by = st.selectbox("排序方式", ["置信度", "教授姓名", "院系"], key=f"sort_by_{key_prefix}")
-        with col3:
-            sort_order = st.selectbox("排序顺序", ["降序", "升序"], key=f"sort_order_{key_prefix}")
-        
-        # 应用过滤
-        filtered_results = [r for r in professor_results if r.get('Confidence Score', 0) >= confidence_filter]
-        
-        # 应用排序
-        if sort_by == "置信度":
-            sort_key = lambda x: x.get('Confidence Score', 0)
-        elif sort_by == "教授姓名":
-            sort_key = lambda x: x.get('Professor Name', '')
-        else:
-            sort_key = lambda x: x.get('Department', '')
-        
-        ascending = (sort_order == "升序")
-        filtered_results = sorted(filtered_results, key=sort_key, reverse=not ascending)
-        
-        # 显示结果
-        for result in filtered_results:
-            with st.expander(f"👨‍🏫 {result.get('Professor Name', 'Unknown')} - {result.get('Title', '')}"):
-                col1, col2 = st.columns([2, 1])
-                
-                with col1:
-                    st.markdown("#### 📍 基本信息")
-                    st.write(f"**姓名:** {result.get('Professor Name', 'N/A')}")
-                    st.write(f"**职位:** {result.get('Title', 'N/A')}")
-                    st.write(f"**院系:** {result.get('Department', 'N/A')}")
-                    st.write(f"**网址:** {result.get('URL', 'N/A')}")
-                    
-                    st.markdown("#### 📖 研究兴趣")
-                    research_interests = result.get('Research Interests', '')
-                    if research_interests:
-                        st.write(research_interests)
-                    else:
-                        st.write("未找到研究兴趣信息")
-                
-                with col2:
-                    st.markdown("#### 🏷️ 关键词")
-                    keywords = result.get('Keywords', [])
-                    if keywords and isinstance(keywords, list) and len(keywords) > 0:
-                        for keyword in keywords:
-                            st.markdown(render_keyword_tag(keyword), unsafe_allow_html=True)
-                    else:
-                        st.write("无关键词")
-                    
-                    st.markdown("#### 📎 相关链接")
-                    additional_urls = result.get('Additional URLs', [])
-                    if additional_urls and isinstance(additional_urls, list) and len(additional_urls) > 0:
-                        for url in additional_urls[:3]:  # 限制显示3个相关链接
-                            st.markdown(f"[相关页面]({url})")
-                    else:
-                        st.write("无相关链接")
-                    
-                    st.markdown("#### 🎯 置信度")
-                    confidence = result.get('Confidence Score', 0)
-                    st.progress(confidence)
-                    st.write(f"{confidence:.1%}")
-        
-        # 提供下载功能
-        st.markdown("---")
-        df_download = pd.DataFrame(professor_results)
-        csv_data = df_download.to_csv(index=False)
-        st.download_button(
-            label="📥 下载教授信息",
-            data=csv_data,
-            file_name="professor_analysis_results.csv",
-            mime="text/csv",
-            key=f"download_button_{key_prefix}"
-        )
+    st.subheader(f"👨‍🏫 找到的教授页面 ({len(professor_results)}位)")
+    
+    # 添加过滤和排序选项 - 使用动态key
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        confidence_filter = st.slider("最低置信度", 0.0, 1.0, 0.0, 0.1, key=f"confidence_filter_{key_prefix}")
+    with col2:
+        sort_by = st.selectbox("排序方式", ["置信度", "教授姓名", "院系"], key=f"sort_by_{key_prefix}")
+    with col3:
+        sort_order = st.selectbox("排序顺序", ["降序", "升序"], key=f"sort_order_{key_prefix}")
+    
+    # 应用过滤
+    filtered_results = [r for r in professor_results if r.get('Confidence Score', 0) >= confidence_filter]
+    
+    # 应用排序
+    if sort_by == "置信度":
+        sort_key = lambda x: x.get('Confidence Score', 0)
+    elif sort_by == "教授姓名":
+        sort_key = lambda x: x.get('Professor Name', '')
     else:
-        st.warning("⚠️ 未找到教授页面")
+        sort_key = lambda x: x.get('Department', '')
     
+    ascending = (sort_order == "升序")
+    filtered_results = sorted(filtered_results, key=sort_key, reverse=not ascending)
+    
+    # 显示结果
+    for result in filtered_results:
+        with st.expander(f"👨‍🏫 {result.get('Professor Name', 'Unknown')} - {result.get('Title', '')}"):
+            col1, col2 = st.columns([2, 1])
+            
+            with col1:
+                st.markdown("#### 📍 基本信息")
+                st.write(f"**姓名:** {result.get('Professor Name', 'N/A')}")
+                st.write(f"**职位:** {result.get('Title', 'N/A')}")
+                st.write(f"**院系:** {result.get('Department', 'N/A')}")
+                st.write(f"**网址:** {result.get('URL', 'N/A')}")
+                
+                st.markdown("#### 📖 研究兴趣")
+                research_interests = result.get('Research Interests', '')
+                if research_interests:
+                    st.write(research_interests)
+                else:
+                    st.write("未找到研究兴趣信息")
+            
+            with col2:
+                st.markdown("#### 🏷️ 关键词")
+                keywords = result.get('Keywords', [])
+                if keywords and isinstance(keywords, list) and len(keywords) > 0:
+                    for keyword in keywords:
+                        st.markdown(render_keyword_tag(keyword), unsafe_allow_html=True)
+                else:
+                    st.write("无关键词")
+                
+                st.markdown("#### 📎 相关链接")
+                additional_urls = result.get('Additional URLs', [])
+                if additional_urls and isinstance(additional_urls, list) and len(additional_urls) > 0:
+                    for url in additional_urls[:3]:  # 限制显示3个相关链接
+                        st.markdown(f"[相关页面]({url})")
+                else:
+                    st.write("无相关链接")
+                
+                st.markdown("#### 🎯 置信度")
+                confidence = result.get('Confidence Score', 0)
+                st.progress(confidence)
+                st.write(f"{confidence:.1%}")
+    
+    # 提供下载功能
+    st.markdown("---")
+    df_download = pd.DataFrame(professor_results)
+    csv_data = df_download.to_csv(index=False)
+    st.download_button(
+        label="📥 下载教授信息",
+        data=csv_data,
+        file_name="professor_analysis_results.csv",
+        mime="text/csv",
+        key=f"download_button_{key_prefix}"
+    )
+
     # 显示分析统计
     st.markdown("---")
     st.markdown("#### 📊 分析统计")
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("总链接数", len(results))
+        st.metric("找到教授", len(professor_results))
     with col2:
-        st.metric("教授页面", len(professor_results))
-    with col3:
-        success_rate = len(professor_results) / len(results) * 100 if results else 0
-        st.metric("成功率", f"{success_rate:.1f}%")
-    with col4:
         avg_confidence = sum(r.get('Confidence Score', 0) for r in professor_results) / len(professor_results) if professor_results else 0
         st.metric("平均置信度", f"{avg_confidence:.1%}")
+    with col3:
+        with_keywords = sum(1 for r in professor_results if r.get('Keywords') and len(r.get('Keywords', [])) > 0)
+        st.metric("含关键词", f"{with_keywords}/{len(professor_results)}")
+
+
+def display_advanced_similarity_results(results_df):
+    """显示多维度相似度分析结果"""
+    if results_df is None or len(results_df) == 0:
+        st.warning("⚠️ 没有结果可显示")
+        return
+
+    # 按分数排序
+    sorted_df = results_df.sort_values(by="Score", ascending=False)
+
+    for _, row in sorted_df.iterrows():
+        # 获取结构化数据
+        similarity_text = row.get("Similarity Analysis", "")
+        similarity_data = extract_structured_similarity_data(similarity_text)
+        
+        # 标题显示总体相似度和置信度
+        confidence_indicator = "🔥" if similarity_data['confidence'] > 0.8 else "✅" if similarity_data['confidence'] > 0.5 else "⚠️"
+        title = f"{confidence_indicator} 相似度 {row['Score']}分 - {row.get('Professor Name', 'Unknown')}"
+        
+        with st.expander(title):
+            col1, col2 = st.columns([2, 1])
+            
+            with col1:
+                st.markdown("#### 👨‍🏫 教授信息")
+                st.write(f"**姓名:** {row.get('Professor Name', 'N/A')}")
+                st.write(f"**职位:** {row.get('Title', 'N/A')}")
+                st.write(f"**院系:** {row.get('Department', 'N/A')}")
+                st.write(f"**网址:** {row['URL']}")
+                
+                st.markdown("#### 📖 研究兴趣")
+                research_text = row["Research Interests"]
+                matched_keywords = similarity_data.get('matched_keywords', [])
+                if matched_keywords:
+                    highlighted_research = highlight_matched_keywords(research_text, matched_keywords)
+                    st.markdown(highlighted_research, unsafe_allow_html=True)
+                else:
+                    st.write(research_text)
+                
+                # 显示多维度分析
+                if similarity_data['success'] and similarity_data['dimension_scores']:
+                    st.markdown("#### 📊 多维度匹配分析")
+                    
+                    # 尝试显示雷达图
+                    radar_fig = render_dimension_radar_chart(similarity_data['dimension_scores'])
+                    if radar_fig:
+                        # 使用教授URL作为唯一key
+                        chart_key = f"radar_chart_{hash(row['URL'])}"
+                        st.plotly_chart(radar_fig, use_container_width=True, key=chart_key)
+                    else:
+                        # 如果没有plotly，使用文本显示
+                        render_dimension_scores(similarity_data['dimension_scores'])
+                    
+                    # 显示详细推理
+                    reasoning = similarity_data['reasoning']
+                    if isinstance(reasoning, dict):
+                        if reasoning.get('strengths'):
+                            st.markdown("**🎯 匹配优势:**")
+                            st.write(reasoning['strengths'])
+                        if reasoning.get('gaps'):
+                            st.markdown("**🔍 待改进点:**")
+                            st.write(reasoning['gaps'])
+                        if reasoning.get('overall'):
+                            st.markdown("**💡 综合评价:**")
+                            st.write(reasoning['overall'])
+                    else:
+                        st.markdown("#### 📝 详细分析")
+                        st.write(similarity_data['reasoning'].get('overall', similarity_text))
+                else:
+                    st.markdown("#### 📝 分析结果")
+                    st.write(similarity_text)
+            
+            with col2:
+                # 显示匹配关键词
+                st.markdown("#### 🔗 匹配关键词")
+                matched_keywords = similarity_data.get('matched_keywords', [])
+                if matched_keywords and isinstance(matched_keywords, list):
+                    for keyword in matched_keywords:
+                        st.markdown(render_keyword_tag(keyword, highlight=True), unsafe_allow_html=True)
+                else:
+                    st.write("无匹配关键词")
+                
+                # 显示教授所有关键词
+                st.markdown("#### 🏷️ 教授关键词")
+                prof_keywords = row.get('Keywords', [])
+                if prof_keywords and isinstance(prof_keywords, list):
+                    for keyword in prof_keywords:
+                        is_matched = keyword in matched_keywords if matched_keywords else False
+                        st.markdown(render_keyword_tag(keyword, highlight=is_matched), unsafe_allow_html=True)
+                else:
+                    st.write("无关键词")
+                
+                # 显示置信度
+                st.markdown("#### 🎯 分析置信度")
+                confidence = similarity_data.get('confidence', 0)
+                st.progress(confidence)
+                st.write(f"{confidence:.1%}")
+                
+                # 显示相关链接
+                st.markdown("#### 📎 相关链接")
+                additional_urls = row.get('Additional URLs', [])
+                if additional_urls and isinstance(additional_urls, list):
+                    for i, url in enumerate(additional_urls[:3]):
+                        st.markdown(f"[相关页面 {i+1}]({url})")
+                else:
+                    st.write("无相关链接")
+
+
+def render_dimension_scores(dimension_scores):
+    """渲染维度分数显示"""
+    dimension_names = {
+        'research_topics': '🎯 研究主题',
+        'research_methods': '🔬 研究方法', 
+        'theoretical_framework': '📚 理论框架',
+        'application_domains': '🌍 应用领域',
+        'keyword_matching': '🔗 关键词匹配'
+    }
+    
+    # 创建两列布局显示维度分数
+    col1, col2 = st.columns(2)
+    
+    dimensions = list(dimension_scores.keys())
+    for i, (dim_key, score) in enumerate(dimension_scores.items()):
+        display_name = dimension_names.get(dim_key, dim_key)
+        
+        # 交替显示在两列中
+        with col1 if i % 2 == 0 else col2:
+            # 使用进度条和分数显示
+            st.metric(label=display_name, value=f"{score}分")
+            st.progress(score / 100.0)
+
+
+def render_dimension_radar_chart(dimension_scores):
+    """渲染五维度雷达图"""
+    try:
+        import plotly.graph_objects as go
+        import plotly.express as px
+        
+        # 维度名称映射
+        dimension_names = {
+            'research_topics': '研究主题',
+            'research_methods': '研究方法', 
+            'theoretical_framework': '理论框架',
+            'application_domains': '应用领域',
+            'keyword_matching': '关键词匹配'
+        }
+        
+        # 提取分数和标签
+        labels = []
+        values = []
+        for key, score in dimension_scores.items():
+            labels.append(dimension_names.get(key, key))
+            values.append(score)
+        
+        # 创建雷达图
+        fig = go.Figure()
+        
+        fig.add_trace(go.Scatterpolar(
+            r=values,
+            theta=labels,
+            fill='toself',
+            fillcolor='rgba(59, 130, 246, 0.2)',
+            line=dict(color='rgba(59, 130, 246, 0.8)', width=2),
+            marker=dict(color='rgba(59, 130, 246, 1)', size=8),
+            name='匹配度'
+        ))
+        
+        fig.update_layout(
+            polar=dict(
+                radialaxis=dict(
+                    visible=True,
+                    range=[0, 100],
+                    tickfont=dict(size=10),
+                    gridcolor='rgba(0,0,0,0.1)'
+                ),
+                angularaxis=dict(
+                    tickfont=dict(size=12)
+                )
+            ),
+            showlegend=False,
+            margin=dict(t=20, b=20, l=20, r=20),
+            height=300,
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)'
+        )
+        
+        return fig
+    except ImportError:
+        # 如果没有plotly，返回None
+        return None
+
+
+def highlight_matched_keywords(text, keywords):
+    """在文本中高亮匹配的关键词"""
+    if not keywords or not text:
+        return text
+    
+    import re
+    highlighted_text = text
+    
+    # 对每个关键词进行高亮处理
+    for keyword in keywords:
+        if keyword and len(keyword.strip()) > 0:
+            # 使用正则表达式进行大小写不敏感的匹配
+            pattern = re.compile(re.escape(keyword.strip()), re.IGNORECASE)
+            highlighted_text = pattern.sub(
+                f'<mark style="background-color: #FFE066; padding: 1px 3px; border-radius: 3px;">{keyword}</mark>',
+                highlighted_text
+            )
+    
+    return highlighted_text
+
+
+def validate_similarity_scores(similarity_data):
+    """验证相似度分数的一致性"""
+    if not similarity_data.get('success', False):
+        return True  # 如果解析失败，跳过验证
+    
+    overall_score = similarity_data.get('overall_score', 0)
+    dimension_scores = similarity_data.get('dimension_scores', {})
+    
+    # 基本范围检查
+    if not (0 <= overall_score <= 100):
+        return False
+    
+    # 检查各维度分数
+    for dim, score in dimension_scores.items():
+        if not isinstance(score, (int, float)) or not (0 <= score <= 100):
+            return False
+    
+    # 一致性检查：总体分数应该与维度分数相关
+    if dimension_scores:
+        avg_dimension_score = sum(dimension_scores.values()) / len(dimension_scores)
+        # 允许±20分的差异，因为总体分数可能有权重
+        if abs(overall_score - avg_dimension_score) > 20:
+            return False
+    
+    return True
 
 
 def main():
@@ -508,7 +894,8 @@ def main():
         # 检查是否有教授结果
         professor_results = None
         if hasattr(st.session_state, 'results') and st.session_state.results:
-            professor_results = [r for r in st.session_state.results if r.get('Is Professor Page') == 'Yes']
+            # 现在results中只包含教授页面
+            professor_results = st.session_state.results
             has_professors = len(professor_results) > 0
         else:
             st.info("ℹ️ 请先在'🔍 网站分析'标签中分析一个网站以获取教授研究兴趣")
@@ -534,16 +921,19 @@ def main():
             elif not has_interests:
                 st.caption("请输入您的研究兴趣")
         with col2:
+            # 检查是否有相似度结果数据
+            has_similarity_results = (
+                hasattr(st.session_state, 'similarity_results') and
+                st.session_state.similarity_results is not None and
+                len(st.session_state.similarity_results) > 0
+            )
+            
             sort_button = st.button(
                 "📊 排序结果",
-                disabled="similarity_results" not in st.session_state
-                or st.session_state.similarity_results is None,
+                disabled=not has_similarity_results,
                 key="sort_results_button"
             )
-            if (
-                "similarity_results" not in st.session_state
-                or st.session_state.similarity_results is None
-            ):
+            if not has_similarity_results:
                 st.caption("请先计算相似度")
 
         # 处理计算相似度按钮
@@ -569,29 +959,39 @@ def main():
                     progress_text.text(
                         f"⏳ 正在计算第 {i+1}/{total_professors} 位教授的相似度..."
                     )
-                    progress_container.info(f"🔄 分析中: {professor.get('url', 'Unknown')}")
+                    progress_container.info(f"🔄 分析中: {professor.get('Professor Name', 'Unknown')}")
 
                     # 计算相似度
-                    similarity = calculate_similarity(
-                        professor.get("research_interests", ""),
+                    similarity = calculate_advanced_similarity(
+                        professor.get("Research Interests", ""),
+                        professor.get("Keywords", []),
                         user_interests,
                         st.session_state.api_key,
                     )
                     # 提取相似度分数
-                    similarity_score = extract_similarity_score(similarity)
+                    similarity_data = extract_structured_similarity_data(similarity)
+                    
+                    # 验证分数一致性
+                    if not validate_similarity_scores(similarity_data):
+                        st.warning(f"⚠️ {professor.get('Professor Name', 'Unknown')} 的相似度分数可能不准确")
 
                     results.append(
                         {
-                            "URL": professor.get("url", ""),
-                            "Professor Name": professor.get("professor_name", ""),
-                            "Title": professor.get("title", ""),
-                            "Department": professor.get("department", ""),
-                            "Research Interests": professor.get("research_interests", ""),
-                            "Keywords": professor.get("keywords", []),
-                            "Additional URLs": professor.get("additional_urls", []),
-                            "Confidence Score": professor.get("confidence_score", 0),
+                            "URL": professor.get("URL", ""),
+                            "Professor Name": professor.get("Professor Name", ""),
+                            "Title": professor.get("Title", ""),
+                            "Department": professor.get("Department", ""),
+                            "Research Interests": professor.get("Research Interests", ""),
+                            "Keywords": professor.get("Keywords", []),
+                            "Additional URLs": professor.get("Additional URLs", []),
+                            "Confidence Score": professor.get("Confidence Score", 0),
                             "Similarity Analysis": similarity,
-                            "Score": similarity_score,
+                            "Score": similarity_data['overall_score'],
+                            "Dimension Scores": similarity_data.get('dimension_scores', {}),
+                            "Matched Keywords": similarity_data.get('matched_keywords', []),
+                            "Similarity Reasoning": similarity_data.get('reasoning', {}),
+                            "Analysis Confidence": similarity_data.get('confidence', 0.0),
+                            "Parsing Success": similarity_data.get('success', False)
                         }
                     )
 
@@ -607,29 +1007,35 @@ def main():
                 st.session_state.similarity_results = pd.DataFrame(results)
 
                 # 显示结果
-                display_results(st.session_state.similarity_results)
+                display_advanced_similarity_results(st.session_state.similarity_results)
 
         # 处理排序按钮
         elif (
-            sort_button
-            and "similarity_results" in st.session_state
-            and st.session_state.similarity_results is not None
+            sort_button and has_similarity_results
         ):
-            # 按相似度分数排序结果
-            sorted_results = st.session_state.similarity_results.sort_values(
-                by="Score", ascending=False
-            )
+            try:
+                # 确保数据是DataFrame格式
+                if isinstance(st.session_state.similarity_results, pd.DataFrame):
+                    sorted_results = st.session_state.similarity_results.sort_values(
+                        by="Score", ascending=False
+                    )
+                else:
+                    # 如果不是DataFrame，先转换
+                    sorted_results = pd.DataFrame(st.session_state.similarity_results).sort_values(
+                        by="Score", ascending=False
+                    )
 
-            st.subheader("📊 排序后的相似度分析结果")
-            display_professor_results(sorted_results.to_dict(orient='records'), key_prefix="tab2_sorted")
+                st.subheader("📊 排序后的相似度分析结果")
+                display_advanced_similarity_results(sorted_results)
+            except Exception as e:
+                st.error(f"排序失败: {str(e)}")
+                st.write("尝试显示原始结果:")
+                display_advanced_similarity_results(st.session_state.similarity_results)
 
         # 如果已有结果但未点击任何按钮，显示之前的结果
-        elif (
-            "similarity_results" in st.session_state
-            and st.session_state.similarity_results is not None
-        ):
+        elif has_similarity_results:
             st.subheader("📊 上次相似度分析结果")
-            display_professor_results(st.session_state.similarity_results.to_dict(orient='records'), key_prefix="tab2_saved")
+            display_advanced_similarity_results(st.session_state.similarity_results)
 
 
 if __name__ == "__main__":
