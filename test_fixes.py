@@ -11,7 +11,8 @@ from main import (
     clean_faculty_url,
     analyze_results_and_adjust_params,
     get_all_links,
-    create_session
+    create_session,
+    analyze_pagination_structure
 )
 
 def test_parameter_recommendations():
@@ -109,6 +110,31 @@ def test_link_extraction():
     except Exception as e:
         print(f"❌ 链接提取测试失败: {e}")
         return 0, 0
+
+
+def test_illinois_pagination_detection():
+    """解析示例HTML，验证数字分页能被检测与估页数>1。"""
+    from bs4 import BeautifulSoup
+    
+    html = """
+    <nav class="pagination">
+      <a class="page-numbers" href="?sf_paged=1&_sft_phd_program_area=design-technology-and-society">1</a>
+      <span class="page-numbers current">2</span>
+      <a class="page-numbers" href="?sf_paged=3&_sft_phd_program_area=design-technology-and-society">3</a>
+      <a class="next page-numbers" href="?sf_paged=3&_sft_phd_program_area=design-technology-and-society">Next »</a>
+    </nav>
+    """
+    soup = BeautifulSoup(html, 'html.parser')
+    info = analyze_pagination_structure(soup, "https://informatics.ischool.illinois.edu/faculty-affiliates/")
+    assert info['has_pagination'] is True
+    assert info['pagination_type'] in ('numbered', 'next_only')
+    assert info['estimated_total_pages'] >= 3
+
+
+def test_clean_faculty_url_preserves_filters():
+    url = "https://informatics.ischool.illinois.edu/faculty-affiliates/?_sft_phd_program_area=design-technology-and-society&sf_paged=2"
+    cleaned = clean_faculty_url(url)
+    assert cleaned == url, "筛选参数应被完整保留，不应清理"
 
 
 if __name__ == "__main__":

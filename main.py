@@ -62,27 +62,76 @@ def create_session() -> requests.Session:
 def detect_next_page(soup: BeautifulSoup, base_url: str) -> Optional[str]:
     """检测分页中的下一页链接
     
-    Args:
-        soup: 当前页面的BeautifulSoup对象
-        base_url: 基础URL，用于解析相对链接
-        
-    Returns:
-        下一页的URL，如果没有找到则返回None
-    """
-    next_link = soup.find("a", rel=lambda x: x and "next" in x.lower())
-    if next_link and next_link.get("href"):
-        href = next_link["href"]
-        if not href.startswith(("http://", "https://")):
-            return urllib.parse.urljoin(base_url, href)
-        return href
+    优先顺序：
+    1) WordPress 数字分页：基于当前页的下一个页码
+    2) 语义标注的下一页：rel="next"、aria-label 包含 next、.page-numbers.next
+    3) 文本回退：链接文本为 Next/»/>/下一页
 
-    for anchor in soup.find_all("a", href=True):
-        text = anchor.get_text(strip=True).lower()
-        if text in ("next", "next page", ">", "»", "下一页"):
-            href = anchor["href"]
-            if not href.startswith(("http://", "https://")):
-                return urllib.parse.urljoin(base_url, href)
-            return href
+    返回绝对URL，未找到则返回None。
+    """
+    try:
+        # 1) 数字分页容器与当前页
+        current_num = None
+        current_tag = soup.select_one(
+            ".page-numbers .current, .pagination .current, .pager .current, span.page-numbers.current, li.current"
+        )
+        if current_tag:
+            try:
+                current_num = int(current_tag.get_text(strip=True))
+            except Exception:
+                current_num = None
+
+        if current_num is not None:
+            for a in soup.select(".page-numbers a, .pagination a, .pager a"):
+                if not a.has_attr("href"):
+                    continue
+                text = a.get_text(strip=True)
+                if text.isdigit() and int(text) == current_num + 1:
+                    href = a["href"].strip()
+                    next_url = urllib.parse.urljoin(base_url, href)
+                    logger.info(f"Pagination (numeric): current={current_num} -> next={next_url}")
+                    return next_url
+
+        # 2) 语义标注的下一页
+        rel_next = soup.find("a", rel=lambda x: x and "next" in x.lower())
+        if rel_next and rel_next.get("href"):
+            href = rel_next["href"].strip()
+            next_url = urllib.parse.urljoin(base_url, href)
+            logger.info(f"Pagination (rel=next): next={next_url}")
+            return next_url
+
+        aria_next = None
+        for a in soup.select("a[aria-label]"):
+            try:
+                label = a.get("aria-label", "").lower()
+                if "next" in label and a.get("href"):
+                    aria_next = a
+                    break
+            except Exception:
+                continue
+        if aria_next is not None:
+            href = aria_next["href"].strip()
+            next_url = urllib.parse.urljoin(base_url, href)
+            logger.info(f"Pagination (aria-label): next={next_url}")
+            return next_url
+
+        pn_next = soup.select_one("a.page-numbers.next, .page-numbers a.next")
+        if pn_next and pn_next.get("href"):
+            href = pn_next["href"].strip()
+            next_url = urllib.parse.urljoin(base_url, href)
+            logger.info(f"Pagination (.page-numbers.next): next={next_url}")
+            return next_url
+
+        # 3) 文本回退
+        for anchor in soup.find_all("a", href=True):
+            text = anchor.get_text(strip=True).lower()
+            if text in ("next", "next page", ">", "»", "下一页"):
+                href = anchor["href"].strip()
+                next_url = urllib.parse.urljoin(base_url, href)
+                logger.info(f"Pagination (text fallback): next={next_url}")
+                return next_url
+    except Exception as e:
+        logger.debug(f"detect_next_page error: {e}")
     return None
 
 
@@ -188,6 +237,7 @@ def get_all_links(
         if follow_pagination:
             next_url = detect_next_page(soup, base_url)
             if next_url and next_url not in visited:
+                logger.info(f"Found next page -> {next_url}")
                 to_visit.append(next_url)
 
         page_count += 1
@@ -1430,7 +1480,8 @@ def analyze_pagination_structure(soup: BeautifulSoup, url: str) -> Dict[str, any
         'has_pagination': False,
         'pagination_type': 'none',
         'estimated_total_pages': 1,
-        'items_per_page': 0
+        'items_per_page': 0,
+        'page_numbers_detected': False
     }
     
     # 查找分页指示器
@@ -1469,6 +1520,7 @@ def analyze_pagination_structure(soup: BeautifulSoup, url: str) -> Dict[str, any
         if page_numbers:
             pagination_info['estimated_total_pages'] = max(page_numbers)
             pagination_info['pagination_type'] = 'numbered'
+            pagination_info['page_numbers_detected'] = True
             logger.info(f"检测到分页: {max(page_numbers)} 页")
         else:
             # 检查是否有"下一页"类型的分页
@@ -1562,6 +1614,11 @@ def generate_parameter_recommendations(
     else:
         max_pages = 1
         reasoning_parts.append("未检测到分页，仅分析首页")
+
+    # 若检测到数字分页，适度放宽页面上限
+    if pagination_info.get('page_numbers_detected', False):
+        max_pages = max(max_pages, min(8, pagination_info.get('estimated_total_pages', max_pages)))
+        reasoning_parts.append("检测到数字分页，提升页面上限至不超过8页")
     
     # 4. 根据页面规模调整
     if page_analysis['total_links'] > 200:
@@ -1575,7 +1632,18 @@ def generate_parameter_recommendations(
         max_links = max(max_links, 15)  # 小型页面，确保足够分析
         reasoning_parts.append("小型页面，确保足够分析")
     
-    # 5. 安全边界
+    # 5. 针对筛选页的链接上限（通过URL特征判断）
+    try:
+        url_lower_for_page = str(page_analysis.get('page_type', ''))
+        is_filter_like = 'faculty_list' in url_lower_for_page or page_analysis.get('has_search_filters', False)
+        if is_filter_like and pagination_info.get('has_pagination', False):
+            # 估算量级：每页25条，按页数上限放大
+            max_links = max(max_links, min(100, 25 * max_pages))
+            reasoning_parts.append("筛选/列表页启发：按每页约25条放宽链接数")
+    except Exception:
+        pass
+
+    # 6. 安全边界
     max_links = max(10, min(100, max_links))  # 限制在10-100之间
     max_pages = max(1, min(10, max_pages))    # 限制在1-10之间
     
@@ -1592,76 +1660,37 @@ def generate_parameter_recommendations(
 
 
 def clean_faculty_url(url: str) -> str:
-    """清理教师页面URL，去除筛选参数"""
+    """清理教师列表URL，但保留筛选/分页参数以避免丢失过滤条件。
+
+    保留规则：
+    - 若检测到筛选键（_sft_*, sf_*, sfid），直接跳过清理，原样返回
+    - 否则，仅保留分页与结构性参数：['sf_paged','paged','page','p','dept','department','college','school']
+    """
     import urllib.parse
     
-    # 解析URL
-    parsed = urllib.parse.urlparse(url)
-    
-    # 特殊处理各种学校的URL模式
-    special_cleaning_patterns = [
-        # NYU系列
-        'steinhardt.nyu.edu',
-        'nyu.edu',
-        # 宾夕法尼亚大学系列
-        'upenn.edu',
-        'asc.upenn.edu',
-        'wharton.upenn.edu',
-        'seas.upenn.edu',
-        # 其他知名大学
-        'harvard.edu',
-        'mit.edu',
-        'stanford.edu',
-        'berkeley.edu',
-        'columbia.edu',
-        'yale.edu',
-        'princeton.edu'
-    ]
-    
-    # 检查是否为需要特殊处理的学校
-    needs_cleaning = any(pattern in parsed.netloc for pattern in special_cleaning_patterns)
-    
-    if needs_cleaning and any(keyword in parsed.path for keyword in ['faculty', 'people', 'staff', 'directory']):
-        # 去除查询参数，保留基础的faculty页面
-        clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-        
-        # 对于带有筛选参数的URL，尝试简化到基础路径
-        if parsed.query:
-            # 检查路径是否以这些关键词结尾
-            faculty_endpoints = ['faculty', 'people', 'staff', 'directory', 'profiles']
-            
-            for endpoint in faculty_endpoints:
-                if clean_url.endswith(endpoint):
-                    return clean_url
-                    
-            # 如果URL包含这些路径，保留到这些路径为止
-            path_parts = parsed.path.split('/')
-            for i, part in enumerate(path_parts):
-                if part in faculty_endpoints:
-                    clean_path = '/'.join(path_parts[:i+1])
-                    return f"{parsed.scheme}://{parsed.netloc}{clean_path}"
-        
-        return clean_url
-    
-    # 对于其他URL，只是去除明显的筛选参数
-    if parsed.query:
-        # 保留重要的查询参数，去除筛选参数
+    try:
+        parsed = urllib.parse.urlparse(url)
         query_params = urllib.parse.parse_qs(parsed.query)
-        important_params = {}
-        
-        # 保留这些参数，因为它们可能是页面结构的一部分
-        preserve_params = ['page', 'p', 'dept', 'department', 'college', 'school']
-        for param in preserve_params:
-            if param in query_params:
-                important_params[param] = query_params[param]
-        
-        if important_params:
-            new_query = urllib.parse.urlencode(important_params, doseq=True)
+        if not query_params:
+            return url
+
+        # 是否为筛选页
+        has_filter_keys = any(k.startswith("_sft_") or k.startswith("sf_") or k == "sfid" for k in query_params.keys())
+        if has_filter_keys:
+            logger.info("clean_faculty_url: 检测到筛选参数，跳过清理")
+            return url
+
+        preserve_params = ['sf_paged', 'paged', 'page', 'p', 'dept', 'department', 'college', 'school']
+        preserved = {k: v for k, v in query_params.items() if k in preserve_params}
+
+        if preserved:
+            new_query = urllib.parse.urlencode(preserved, doseq=True)
             return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{new_query}"
         else:
             return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-    
-    return url
+    except Exception as e:
+        logger.debug(f"clean_faculty_url error: {e}")
+        return url
 
 
 def adaptive_analysis_with_intelligent_params(
@@ -1683,7 +1712,7 @@ def adaptive_analysis_with_intelligent_params(
     """
     logger.info(f"开始自适应分析: {start_url}")
     
-    # 清理URL，去除筛选参数
+    # 清理URL，去除筛选参数（若为筛选页将自动跳过清理）
     clean_url = clean_faculty_url(start_url)
     if clean_url != start_url:
         logger.info(f"URL已清理: {start_url} -> {clean_url}")
