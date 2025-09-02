@@ -429,9 +429,14 @@ def get_research_interests(url, session=None, client=None):
             if items and len(" ".join(items)) < 1000:  # 避免过长的列表
                 list_items.extend(items)
 
-        # 5. 查找相关链接并获取额外信息
-        related_links = find_related_professor_links(url, session)
-        additional_info = integrate_professor_info(url, related_links, session, client)
+        # 5. 禁用外链抓取与整合（仅分析本页）
+        logger.info("已禁用相关链接整合：仅分析教授个人主页本页内容")
+        additional_info = {
+            'additional_research_info': '',
+            'cv_info': '',
+            'publications_info': '',
+            'additional_urls': []
+        }
 
         # 6. 构建全面的分析内容
         comprehensive_content = {
@@ -445,6 +450,11 @@ def get_research_interests(url, session=None, client=None):
             "additional_publications": additional_info.get('publications_info', ''),
             "additional_research": additional_info.get('additional_research_info', '')
         }
+
+        # 辅助：检测内容不足与不招博士生
+        page_full_text = soup.get_text(separator=" ", strip=True)
+        is_insufficient, insufficient_reasons = detect_insufficient_content(page_full_text, soup)
+        not_recruiting, evidence = detect_phd_not_recruiting(page_full_text)
 
         # 7. 构建给LLM的综合提示词
         analysis_prompt = _build_comprehensive_analysis_prompt(comprehensive_content)
@@ -497,7 +507,11 @@ def get_research_interests(url, session=None, client=None):
             return {
                 "interests": clean_interests,
                 "keywords": keywords,
-                "additional_urls": additional_info.get('additional_urls', []),
+                "additional_urls": [],
+                "insufficient_content": is_insufficient,
+                "insufficient_reasons": insufficient_reasons,
+                "phd_not_recruiting": not_recruiting,
+                "phd_evidence": evidence,
             }
             
         except json.JSONDecodeError:
@@ -506,7 +520,11 @@ def get_research_interests(url, session=None, client=None):
             return {
                 "interests": clean_interests,
                 "keywords": [],
-                "additional_urls": additional_info.get('additional_urls', []),
+                "additional_urls": [],
+                "insufficient_content": is_insufficient,
+                "insufficient_reasons": insufficient_reasons,
+                "phd_not_recruiting": not_recruiting,
+                "phd_evidence": evidence,
             }
             
     except Exception as e:
@@ -515,6 +533,10 @@ def get_research_interests(url, session=None, client=None):
             "interests": "Unable to determine research interests",
             "keywords": [],
             "additional_urls": [],
+            "insufficient_content": True,
+            "insufficient_reasons": ["exception_during_extraction"],
+            "phd_not_recruiting": False,
+            "phd_evidence": "",
         }
 
 
@@ -577,7 +599,11 @@ def process_link(link, session, client=None):
                 "Research Interests": research_data.get("interests", ""),
                 "Keywords": research_data.get("keywords", []),
                 "Additional URLs": research_data.get("additional_urls", []),
-                "Confidence Score": prof_info.get("confidence", 0.0)
+                "Confidence Score": prof_info.get("confidence", 0.0),
+                "Insufficient Content": research_data.get("insufficient_content", False),
+                "Insufficient Reasons": research_data.get("insufficient_reasons", []),
+                "PhD Not Recruiting": research_data.get("phd_not_recruiting", False),
+                "PhD Evidence": research_data.get("phd_evidence", "")
             }
         else:
             # 非教授页面不返回结果，不在最终结果中列举
@@ -614,6 +640,35 @@ def analyze_webpage_links(start_url, api_key, max_links=50, max_workers=5, max_p
     # Create a session for consistent connections
     session = create_session()
 
+    # 先判断起始URL是否就是教授个人主页，如果是则进入单页模式
+    try:
+        is_prof, _prof_info = is_professor_webpage(start_url, session, client)
+    except Exception as e:
+        logger.warning(f"起始URL教授判定失败，回退到常规流程: {e}")
+        is_prof = False
+        _prof_info = {}
+
+    if is_prof:
+        logger.info("检测到起始URL为教授个人主页，启用单页分析模式 (不抓取外链)")
+        try:
+            single_result = process_link(start_url, session, client)
+            results = []
+            if single_result:
+                results.append(single_result)
+            # Create DataFrame（包含扩展字段，以便空结果也有一致表头）
+            df = pd.DataFrame(results, columns=[
+                "URL", "Professor Name", "Title", "Department", "Is Professor Page",
+                "Research Interests", "Keywords", "Additional URLs", "Confidence Score",
+                "Insufficient Content", "Insufficient Reasons", "PhD Not Recruiting", "PhD Evidence"
+            ])
+            logger.info(
+                f"单页分析完成。教授页面数量: {len(results)} (起始URL: {start_url})"
+            )
+            return df
+        except Exception as e:
+            logger.error(f"单页模式分析失败，回退到常规流程: {e}")
+            # 若单页失败，继续常规流程
+
     # Get all links from the starting URL, following pagination if present
     all_links = get_all_links(
         start_url, session, follow_pagination=True, max_pages=max_pages
@@ -624,7 +679,11 @@ def analyze_webpage_links(start_url, api_key, max_links=50, max_workers=5, max_p
         logger.warning(
             "No links found to analyze. Check if the website is accessible or has changed structure."
         )
-        return pd.DataFrame(columns=["URL", "Professor Name", "Title", "Department", "Is Professor Page", "Research Interests", "Keywords", "Additional URLs", "Confidence Score"])
+        return pd.DataFrame(columns=[
+            "URL", "Professor Name", "Title", "Department", "Is Professor Page",
+            "Research Interests", "Keywords", "Additional URLs", "Confidence Score",
+            "Insufficient Content", "Insufficient Reasons", "PhD Not Recruiting", "PhD Evidence"
+        ])
 
     # Print some of the links we're going to check
     for i, link in enumerate(all_links[:10]):
@@ -654,7 +713,11 @@ def analyze_webpage_links(start_url, api_key, max_links=50, max_workers=5, max_p
                 # 错误情况也不再添加到结果中
 
     # Create DataFrame
-    df = pd.DataFrame(results)
+    df = pd.DataFrame(results, columns=[
+        "URL", "Professor Name", "Title", "Department", "Is Professor Page",
+        "Research Interests", "Keywords", "Additional URLs", "Confidence Score",
+        "Insufficient Content", "Insufficient Reasons", "PhD Not Recruiting", "PhD Evidence"
+    ])
 
     logger.info(
         f"Analysis complete. Found {len(results)} professor pages out of {len(all_links)} total links analyzed."
@@ -977,6 +1040,102 @@ def extract_keywords(research_text):
     
     # 这个函数将由LLM来实现，返回关键词列表
     return []  # 占位符，将在get_research_interests中通过LLM实现
+
+
+def extract_sentence_snippet(full_text: str, match_span: tuple, window: int = 80) -> str:
+    """从全文中根据匹配位置截取证据片段。
+    
+    Args:
+        full_text: 完整文本
+        match_span: (start, end) 匹配区间
+        window: 左右扩展窗口大小
+    Returns:
+        证据片段字符串
+    """
+    try:
+        start, end = match_span
+        left = max(0, start - window)
+        right = min(len(full_text), end + window)
+        snippet = full_text[left:right].strip()
+        return snippet
+    except Exception:
+        return ""
+
+
+def detect_phd_not_recruiting(text: str) -> tuple:
+    """检测页面中是否明确声明不招收博士生。
+    
+    Returns:
+        (is_not_recruiting: bool, evidence: str)
+    """
+    if not text:
+        return False, ""
+    patterns = [
+        # 英文
+        r"not\s+(accepting|taking|recruiting)\s+(phd|doctoral)\s+students",
+        r"no\s+(phd|doctoral)\s+(openings|positions|students)",
+        r"not\s+accepting\s+graduate\s+students",
+        r"not\s+recruiting\s+graduate\s+students",
+        r"no\s+graduate\s+students",
+        # 中文
+        r"不招(收|受)博士生",
+        r"不接受博士生",
+        r"暂停(招收|接收)博士生",
+        r"目前不(招|收)博士生",
+    ]
+    text_norm = text.lower()
+    for pattern in patterns:
+        m = re.search(pattern, text_norm, flags=re.IGNORECASE)
+        if m:
+            evidence = extract_sentence_snippet(text, m.span())
+            return True, evidence
+    return False, ""
+
+
+def detect_insufficient_content(text: str, soup: BeautifulSoup) -> tuple:
+    """基于启发式规则检测内容是否不足。
+    
+    Returns:
+        (is_insufficient: bool, reasons: List[str])
+    """
+    reasons = []
+    try:
+        visible_text = text or ""
+        # 规则1：文本太短
+        if len(visible_text) < 800:
+            reasons.append("too_short_text")
+
+        # 规则2：研究相关标题数量
+        research_keywords = [
+            "research", "interests", "projects", "expertise", "areas",
+            "publications", "work", "studies", "focus"
+        ]
+        headers = soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]) if soup else []
+        header_hits = 0
+        for h in headers:
+            ht = h.get_text(strip=True).lower()
+            if any(k in ht for k in research_keywords):
+                header_hits += 1
+        if header_hits == 0:
+            reasons.append("no_research_section")
+
+        # 规则3：段落过少且缺少研究关键词
+        paras = soup.find_all("p") if soup else []
+        has_research_kw = any(k in (visible_text.lower()) for k in [
+            "research", "interests", "publications", "projects"
+        ])
+        if len(paras) < 3 and not has_research_kw:
+            reasons.append("few_paragraphs_no_keywords")
+
+        # 规则4：主要为联系/行政信息（简单启发式）
+        contact_markers = ["email", "@", "phone", "contact", "address", "office"]
+        header_text = (soup.get_text(" ", strip=True).lower() if soup else visible_text.lower())
+        if sum(header_text.count(m) for m in contact_markers) >= 3 and len(visible_text) < 1200:
+            reasons.append("mostly_contact_admin")
+
+        return (len(reasons) > 0), reasons
+    except Exception:
+        return False, []
 
 
 def find_related_professor_links(url, session=None):

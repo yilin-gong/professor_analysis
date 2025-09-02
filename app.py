@@ -361,7 +361,19 @@ def display_professor_results(results: list, key_prefix: str = "default"):
     
     # 显示结果
     for result in filtered_results:
-        with st.expander(f"👨‍🏫 {result.get('Professor Name', 'Unknown')} - {result.get('Title', '')}"):
+        # 组装标题徽标
+        title_badges = []
+        if result.get('PhD Not Recruiting', False):
+            title_badges.append("❌ 不招博士生")
+        if result.get('Insufficient Content', False):
+            title_badges.append("⚠️ 内容不足")
+        badges_str = ("  ".join(title_badges)) if title_badges else ""
+
+        display_title = f"👨‍🏫 {result.get('Professor Name', 'Unknown')} - {result.get('Title', '')}"
+        if badges_str:
+            display_title = f"{display_title}  |  {badges_str}"
+
+        with st.expander(display_title):
             col1, col2 = st.columns([2, 1])
             
             with col1:
@@ -377,6 +389,31 @@ def display_professor_results(results: list, key_prefix: str = "default"):
                     st.write(research_interests)
                 else:
                     st.write("未找到研究兴趣信息")
+
+                # 高亮状态区
+                if result.get('PhD Not Recruiting', False):
+                    st.markdown("#### ❌ 不招博士生")
+                    evidence = result.get('PhD Evidence', '')
+                    if evidence:
+                        st.info(evidence)
+                    else:
+                        st.info("页面明确表示当前不招收博士生")
+                if result.get('Insufficient Content', False):
+                    st.markdown("#### ⚠️ 内容不足")
+                    reasons = result.get('Insufficient Reasons', []) or []
+                    if reasons:
+                        # 将枚举转换为可读标签
+                        reason_map = {
+                            'too_short_text': '页面文本过短',
+                            'no_research_section': '缺少研究相关板块',
+                            'few_paragraphs_no_keywords': '段落过少且缺少研究关键词',
+                            'mostly_contact_admin': '主要为联系/行政信息',
+                            'exception_during_extraction': '提取过程中发生异常'
+                        }
+                        readable = [reason_map.get(r, r) for r in reasons]
+                        st.warning("；".join(readable))
+                    else:
+                        st.warning("页面可用信息不足")
             
             with col2:
                 st.markdown("#### 🏷️ 关键词")
