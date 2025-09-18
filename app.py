@@ -53,7 +53,7 @@ def calculate_similarity(prof_interests, user_interests, api_key):
         current_client = get_client(api_key)
 
         llm_response = current_client.chat.completions.create(
-            model="doubao-1-5-pro-32k-250115",
+            model="doubao-seed-1-6-250615",
             messages=[
                 {
                     "role": "system",
@@ -261,7 +261,7 @@ def calculate_advanced_similarity(prof_interests, prof_keywords, user_interests,
 请按照要求的JSON格式进行多维度分析。"""
 
         llm_response = current_client.chat.completions.create(
-            model="doubao-1-5-pro-32k-250115",
+            model="doubao-seed-1-6-250615",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}

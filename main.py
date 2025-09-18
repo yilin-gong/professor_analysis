@@ -1406,7 +1406,7 @@ def robust_llm_call(client, messages, max_retries=3, backoff_factor=1.0):
     for attempt in range(max_retries):
         try:
             response = client.chat.completions.create(
-                model="doubao-1-5-pro-32k-250115",
+                model="doubao-seed-1-6-250615",
                 messages=messages,
                 timeout=30  # 增加超时时间
             )

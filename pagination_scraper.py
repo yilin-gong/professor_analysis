@@ -61,7 +61,7 @@ def fetch_page_summary(url, client, use_browser=False):
     text = soup.get_text(separator=' ', strip=True)[:3000]
 
     response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
+        model="doubao-seed-1-6-250615",
         messages=[
             {
                 "role": "system",
@@ -89,7 +89,7 @@ def crawl(start_url, api_key, max_pages=3, use_browser=False):
     For each professor link found, the page is summarized with the OpenAI API.
     """
 
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(api_key=api_key, base_url="https://ark.cn-beijing.volces.com/api/v3")
     current = start_url
     page_num = 1
     results = []
