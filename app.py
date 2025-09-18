@@ -899,6 +899,10 @@ def main():
                         
                         progress_bar.progress(100)
                         
+                        # 标准化结果为列表，避免 DataFrame 真值歧义并统一下游处理
+                        if isinstance(results, pd.DataFrame):
+                            results = results.to_dict('records')
+
                         if results:
                             st.success(f"✅ 分析完成！找到 {len(results)} 个链接")
                             st.session_state.results = results
