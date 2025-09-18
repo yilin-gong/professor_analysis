@@ -204,10 +204,37 @@ def get_all_links(
 
         for anchor in soup.find_all("a", href=True):
             href = anchor["href"].strip()
-            anchor_text = anchor.get_text(strip=True).lower()
+            original_anchor_text = anchor.get_text(strip=True)
+            anchor_text = original_anchor_text.lower()
 
-            # 基础过滤
-            if not href or href.startswith(("javascript:", "mailto:", "tel:", "#")):
+            # 基础过滤与占位符 data-* 回退
+            if not href or href.startswith(("javascript:", "#")):
+                # 尝试从 data-* 属性中回退真实链接
+                fallback_attrs = [
+                    "data-url", "data-href", "data-link", "data-target", "data-profile-url"
+                ]
+                fallback_url = None
+                for attr in fallback_attrs:
+                    val = anchor.get(attr)
+                    if val and isinstance(val, str) and val.strip():
+                        candidate = urllib.parse.urljoin(base_url, val.strip())
+                        try:
+                            cand_host = urllib.parse.urlparse(candidate).netloc
+                            base_host = urllib.parse.urlparse(base_url).netloc
+                            if cand_host == base_host and not candidate.lower().endswith((
+                                ".pdf", ".jpg", ".jpeg", ".png", ".gif", ".zip", ".doc", ".docx", ".ppt", ".pptx"
+                            )):
+                                fallback_url = candidate
+                                break
+                        except Exception:
+                            continue
+                if fallback_url:
+                    href = fallback_url
+                else:
+                    # 无合适回退，跳过
+                    continue
+            # 明确过滤 mailto/tel
+            if href.startswith(("mailto:", "tel:")):
                 continue
 
             if not href.startswith(("http://", "https://")):
@@ -223,14 +250,33 @@ def get_all_links(
             # 检测页面类型并动态调整阈值
             is_academic_page = detect_academic_page_type(base_url, page_structure)
             threshold = 1.5 if is_academic_page else 2  # 学术页面使用更低阈值
+
+            # 对 Profile 类锚文本在学术页应用更低的单链接阈值
+            aria_label_text = (anchor.get("aria-label") or "").lower()
+            profile_terms = [
+                "view full profile", "full profile", "view profile",
+                "profile page", "faculty profile", "profile",
+                "个人主页", "完整档案", "查看个人主页", "查看完整档案", "个人简介"
+            ]
+            is_profile_like = any(term in anchor_text for term in profile_terms) or 
+                              any(term in aria_label_text for term in profile_terms)
+            candidate_threshold = threshold
+            if is_academic_page and is_profile_like:
+                candidate_threshold = min(threshold, 1.0)
             
-            # 只保留评分大于阈值的链接
-            if score > threshold:
+            # 只保留评分大于阈值的链接（对 Profile 文案可能使用更低阈值）
+            if score > candidate_threshold:
                 links.append((href, score))
                 if score >= 5:  # 高分链接记录日志
                     logger.info(f"High-score professor link found: {href} (Score: {score}) - Text: {anchor_text}")
                 elif is_academic_page and score > 3:
                     logger.info(f"Academic page link found: {href} (Score: {score}) - Text: {anchor_text}")
+                elif is_profile_like and candidate_threshold < threshold:
+                    logger.info(f"Profile-like link accepted (lower threshold): {href} (Score: {score}, Thr: {candidate_threshold}) - Text: {original_anchor_text}")
+            else:
+                # 记录 Profile 文案但分数未过阈值的候选，便于排查
+                if is_profile_like:
+                    logger.debug(f"Profile-like candidate not accepted: {href} (Score: {score}, Thr: {candidate_threshold}) - Text: {original_anchor_text}")
 
         collected.extend(links)
 
@@ -840,6 +886,43 @@ def calculate_link_score(anchor, href, page_structure, base_url):
     
     # 检测页面类型 - 学术机构特殊处理
     is_academic_page = detect_academic_page_type(base_url, page_structure)
+
+    # Profile 类锚文本加分（包含 aria-label 兜底）
+    try:
+        profile_text_hits = [
+            "view full profile", "full profile", "view profile",
+            "profile page", "faculty profile", "profile",
+            "个人主页", "完整档案", "查看个人主页", "查看完整档案", "个人简介"
+        ]
+        aria_label_text = ""
+        try:
+            aria_label_text = (anchor.get("aria-label") or "").lower()
+        except Exception:
+            aria_label_text = ""
+
+        def _contains_profile_phrase(text_value: str) -> bool:
+            if not text_value:
+                return False
+            t = text_value.lower()
+            return any(p in t for p in profile_text_hits)
+
+        profile_hit = _contains_profile_phrase(anchor_text) or _contains_profile_phrase(aria_label_text)
+        if profile_hit:
+            # 强命中（包含“view full profile”或“full profile”）
+            strong_terms = ["view full profile", "full profile"]
+            if any(term in anchor_text for term in strong_terms) or any(term in aria_label_text for term in strong_terms):
+                score += 1.5
+            else:
+                score += 1.0
+            if is_academic_page:
+                score += 0.5
+            try:
+                logger.info(f"Profile-like link found: {href} - text='{original_anchor_text}'")
+            except Exception:
+                pass
+    except Exception:
+        # 加分失败不影响主流程
+        pass
     
     # 教授相关关键词匹配 (最高4分) - 扩展关键词列表
     professor_keywords = [
@@ -928,6 +1011,18 @@ def calculate_link_score(anchor, href, page_structure, base_url):
     # 调试日志 - 提高日志质量
     if score > 2:  # 降低日志阈值，记录更多潜在链接
         logger.debug(f"Link scoring: '{original_anchor_text}' -> {href} = {score:.1f} points (academic: {is_academic_page})")
+    else:
+        # 对 Profile 文案打分较低的情况也记录，便于调参与排查
+        try:
+            profile_probe_terms = [
+                "view full profile", "full profile", "view profile",
+                "profile page", "faculty profile", "profile",
+                "个人主页", "完整档案", "查看个人主页", "查看完整档案", "个人简介"
+            ]
+            if any(p in anchor_text for p in profile_probe_terms):
+                logger.debug(f"Profile-like low score: '{original_anchor_text}' -> {href} = {score:.1f}")
+        except Exception:
+            pass
     
     # 确保分数在0-10范围内
     return max(0, min(10, score))
