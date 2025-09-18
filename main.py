@@ -258,8 +258,7 @@ def get_all_links(
                 "profile page", "faculty profile", "profile",
                 "个人主页", "完整档案", "查看个人主页", "查看完整档案", "个人简介"
             ]
-            is_profile_like = any(term in anchor_text for term in profile_terms) or 
-                              any(term in aria_label_text for term in profile_terms)
+            is_profile_like = any(term in anchor_text for term in profile_terms) or any(term in aria_label_text for term in profile_terms)
             candidate_threshold = threshold
             if is_academic_page and is_profile_like:
                 candidate_threshold = min(threshold, 1.0)
