@@ -454,8 +454,13 @@ def get_research_interests(url, session=None, client=None):
                 current_level = int(header.name[1])  # h1=1, h2=2, etc.
                 
                 for sibling in header.find_next_siblings():
-                    if (sibling.name and sibling.name.startswith('h') and 
-                        int(sibling.name[1]) <= current_level):
+                    if (
+                        sibling.name 
+                        and sibling.name.startswith('h') 
+                        and len(sibling.name) > 1 
+                        and sibling.name[1].isdigit() 
+                        and int(sibling.name[1]) <= current_level
+                    ):
                         break
                     if sibling.name in ["p", "ul", "ol", "div", "section"]:
                         content = sibling.get_text(strip=True)
