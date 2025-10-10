@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import re
 import json
-from typing import List, Optional
+from typing import Callable, List, Optional, Tuple
 from urllib.parse import urlparse, urlunparse, ParseResult, urljoin
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, FeatureNotFound
 
 from .models import ProfileResult, ContactInfo
 from .utils import normalize_whitespace, extract_mailto_emails_from_html, extract_emails, select_professor_emails, keywords_from_interest
@@ -42,6 +42,15 @@ def _is_name(text: str) -> bool:
 	if "," in text and len(text) <= 120:
 		return True
 	return bool(NAME_LIKE_PAT.search(text))
+
+
+def _detect_syracuse(soup: BeautifulSoup, root: BeautifulSoup, base_url: str) -> bool:
+	"""Detect the Syracuse Newhouse React directory by its component markup."""
+	if soup.select_one('[data-component*="faculty"]'):
+		return True
+	if soup.select_one('[data-react-class*="Faculty"]'):
+		return True
+	return bool(soup.select_one('section[class*="faculty-card"], div[class*="faculty-card"]'))
 
 
 def _extract_from_syracuse(soup: BeautifulSoup, base_url: str) -> List[ProfileResult]:
@@ -119,6 +128,10 @@ def _extract_from_syracuse(soup: BeautifulSoup, base_url: str) -> List[ProfileRe
 	return profiles
 
 
+def _detect_udel(soup: BeautifulSoup, root: BeautifulSoup, base_url: str) -> bool:
+	return bool(root.select_one('li img[alt^="Headshot photo of"]'))
+
+
 def _extract_from_udel(soup: BeautifulSoup, base_url: str) -> List[ProfileResult]:
 	"""UDel-specific parser that handles the card-based faculty page."""
 	profiles = []
@@ -177,6 +190,10 @@ def _extract_from_udel(soup: BeautifulSoup, base_url: str) -> List[ProfileResult
 		))
 	
 	return profiles
+
+
+def _detect_lsu(soup: BeautifulSoup, root: BeautifulSoup, base_url: str) -> bool:
+	return bool(root.select_one('table.scholarships'))
 
 
 def _extract_from_lsu(soup: BeautifulSoup, base_url: str) -> List[ProfileResult]:
@@ -239,6 +256,18 @@ def _extract_from_lsu(soup: BeautifulSoup, base_url: str) -> List[ProfileResult]
 	return profiles
 
 
+def _detect_uky(soup: BeautifulSoup, root: BeautifulSoup, base_url: str) -> bool:
+	for header in root.find_all('h3'):
+		if not header.get_text(strip=True):
+			continue
+		next_el = header.find_next_sibling()
+		while next_el and next_el.name not in ('h3', 'hr'):
+			if next_el.find('strong'):
+				return True
+			next_el = next_el.find_next_sibling()
+	return False
+
+
 def _extract_from_uky(soup: BeautifulSoup, base_url: str, university: Optional[str], program: Optional[str]) -> List[ProfileResult]:
 	"""UKY-specific parser that handles linkless profiles on the main directory page."""
 	profiles = []
@@ -281,6 +310,13 @@ def _extract_from_uky(soup: BeautifulSoup, base_url: str, university: Optional[s
 			))
 			
 	return profiles
+
+
+def _detect_unm(soup: BeautifulSoup, root: BeautifulSoup, base_url: str) -> bool:
+	container = soup.select_one('.main-content .col-sm-12')
+	if not container:
+		return False
+	return bool(container.find('h3'))
 
 
 def _extract_from_unm(soup: BeautifulSoup, base_url: str, university: Optional[str], program: Optional[str]) -> List[ProfileResult]:
@@ -336,6 +372,10 @@ def _extract_from_unm(soup: BeautifulSoup, base_url: str, university: Optional[s
 	return profiles
 
 
+def _detect_asu_isearch(soup: BeautifulSoup, root: BeautifulSoup, base_url: str) -> bool:
+	return bool(root.select_one('div#clas-isearch-react[data-config]'))
+
+
 def _extract_from_asu_isearch_react(soup: BeautifulSoup, base_url: str, university: Optional[str], program: Optional[str]) -> List[ProfileResult]:
 	"""ASU-specific parser for iSearch React component data."""
 	profiles = []
@@ -361,34 +401,58 @@ def _extract_from_asu_isearch_react(soup: BeautifulSoup, base_url: str, universi
 	return profiles
 
 
+Detector = Callable[[BeautifulSoup, BeautifulSoup, str], bool]
+Extractor = Callable[[BeautifulSoup, BeautifulSoup, str, Optional[str], Optional[str]], List[ProfileResult]]
+
+
+SPECIALIZED_LIST_HANDLERS: List[Tuple[Detector, Extractor]] = [
+	(
+		_detect_unm,
+		lambda soup, root, base_url, university, program: _extract_from_unm(
+			root, base_url, university, program
+		),
+	),
+	(
+		_detect_uky,
+		lambda soup, root, base_url, university, program: _extract_from_uky(
+			root, base_url, university, program
+		),
+	),
+	(
+		_detect_lsu,
+		lambda soup, root, base_url, university, program: _extract_from_lsu(root, base_url),
+	),
+	(
+		_detect_syracuse,
+		lambda soup, root, base_url, university, program: _extract_from_syracuse(
+			soup, base_url
+		),
+	),
+	(
+		_detect_udel,
+		lambda soup, root, base_url, university, program: _extract_from_udel(soup, base_url),
+	),
+	(
+		_detect_asu_isearch,
+		lambda soup, root, base_url, university, program: _extract_from_asu_isearch_react(
+			root, base_url, university, program
+		),
+	),
+]
+
+
 def extract_profiles_from_listing(html: str, base_url: str, university: Optional[str], program: Optional[str]) -> List[ProfileResult]:
-	soup = BeautifulSoup(html, "lxml")
+	try:
+		soup = BeautifulSoup(html, "lxml")
+	except FeatureNotFound:
+		soup = BeautifulSoup(html, "html.parser")
 	root = _choose_content_root(soup)
 
-	if "cjdept.unm.edu" in base_url:
-		return _extract_from_unm(root, base_url, university, program)
-	if "ci.uky.edu" in base_url:
-		return _extract_from_uky(root, base_url, university, program)
-	if "www.lsu.edu/manship" in base_url:
-		return _extract_from_lsu(root, base_url)
-
-	# Syracuse Newhouse specific parser
-	if "newhouse.syracuse.edu" in base_url and "faculty" in base_url:
-		syracuse_profiles = _extract_from_syracuse(soup, base_url)
-		if syracuse_profiles:
-			return syracuse_profiles
-
-	# UDel Communication specific parser
-	if "udel.edu" in base_url and "communication" in base_url and "our-people" in base_url:
-		udel_profiles = _extract_from_udel(soup, base_url)
-		if udel_profiles:
-			return udel_profiles
-
-	# ASU Human Communication specific parser
-	if "humancommunication.asu.edu" in base_url:
-		asu_profiles = _extract_from_asu_isearch_react(root, base_url, university, program)
-		if asu_profiles:
-			return asu_profiles
+	for detector, extractor in SPECIALIZED_LIST_HANDLERS:
+		if detector(soup, root, base_url):
+			profiles = extractor(soup, root, base_url, university, program)
+			if profiles:
+				return profiles
 
 	profiles: List[ProfileResult] = []
 
