@@ -430,7 +430,7 @@ SPECIALIZED_LIST_HANDLERS: List[Tuple[Detector, Extractor]] = [
 	),
 	(
 		_detect_udel,
-		lambda soup, root, base_url, university, program: _extract_from_udel(root, base_url),
+		lambda soup, root, base_url, university, program: _extract_from_udel(soup, base_url),
 	),
 	(
 		_detect_asu_isearch,
