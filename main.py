@@ -1433,14 +1433,19 @@ def detect_professor_listing_structure(soup: BeautifulSoup, url: str) -> Dict[st
         info['list_keyword_hits'] = len(anchor_matches)
 
         parent_counter: Counter = Counter()
+        seen_parent_nodes: set = set()
         for anchor in anchor_matches:
             parent = anchor.find_parent(['li', 'div', 'article', 'section', 'tr'])
             if not parent:
                 continue
+            parent_identity = id(parent)
+            if parent_identity in seen_parent_nodes:
+                continue
+            seen_parent_nodes.add(parent_identity)
+
             key = (
                 parent.name,
                 tuple(sorted(parent.get('class', [])[:3])),
-                parent.get('id', ''),
             )
             parent_counter[key] += 1
 
@@ -1448,12 +1453,10 @@ def detect_professor_listing_structure(soup: BeautifulSoup, url: str) -> Dict[st
 
         if parent_counter:
             dominant_key, _ = parent_counter.most_common(1)[0]
-            tag, classes, identifier = dominant_key
+            tag, classes = dominant_key
             descriptor_parts = [tag]
             if classes:
                 descriptor_parts.append('.'.join(classes))
-            if identifier:
-                descriptor_parts.append(f"#{identifier}")
             info['dominant_structure'] = ' '.join(descriptor_parts)
 
         name_pattern = re.compile(r'^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2}$')
