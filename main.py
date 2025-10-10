@@ -13,6 +13,7 @@ import re
 from typing import Dict, List, Tuple, Optional, Union
 import json
 import argparse
+from collections import Counter
 
 # Set up logging
 logging.basicConfig(
@@ -1359,7 +1360,7 @@ def robust_web_request(session, url, max_retries=3, timeout=15):
 
 def intelligent_parameter_estimation(url: str, session: Optional[requests.Session] = None) -> Dict[str, int]:
     """智能估计最优的分析参数
-    
+
     Args:
         url: 起始页面URL
         session: HTTP会话对象
@@ -1401,6 +1402,115 @@ def intelligent_parameter_estimation(url: str, session: Optional[requests.Sessio
         }
 
 
+def detect_professor_listing_structure(soup: BeautifulSoup, url: str) -> Dict[str, Union[bool, int, float, str]]:
+    """Analyze DOM patterns to determine if the page contains a professor listing."""
+
+    info: Dict[str, Union[bool, int, float, str]] = {
+        'is_listing': False,
+        'entry_count': 0,
+        'confidence': 0.0,
+        'dominant_structure': '',
+        'name_heading_count': 0,
+        'list_keyword_hits': 0,
+    }
+
+    try:
+        professor_keywords = [
+            'faculty', 'professor', 'associate professor', 'assistant professor', 'lecturer',
+            'ph.d', 'phd', 'researcher', 'staff', 'people', 'team', 'scholar', 'dr.'
+        ]
+
+        anchor_matches = []
+        for anchor in soup.find_all('a', href=True):
+            text = anchor.get_text(strip=True).lower()
+            href = anchor['href'].lower()
+            if not text and not href:
+                continue
+            if any(keyword in text for keyword in professor_keywords) or \
+               any(keyword in href for keyword in professor_keywords):
+                anchor_matches.append(anchor)
+
+        info['list_keyword_hits'] = len(anchor_matches)
+
+        parent_counter: Counter = Counter()
+        for anchor in anchor_matches:
+            parent = anchor.find_parent(['li', 'div', 'article', 'section', 'tr'])
+            if not parent:
+                continue
+            key = (
+                parent.name,
+                tuple(sorted(parent.get('class', [])[:3])),
+                parent.get('id', ''),
+            )
+            parent_counter[key] += 1
+
+        dominant_count = max(parent_counter.values()) if parent_counter else 0
+
+        if parent_counter:
+            dominant_key, _ = parent_counter.most_common(1)[0]
+            tag, classes, identifier = dominant_key
+            descriptor_parts = [tag]
+            if classes:
+                descriptor_parts.append('.'.join(classes))
+            if identifier:
+                descriptor_parts.append(f"#{identifier}")
+            info['dominant_structure'] = ' '.join(descriptor_parts)
+
+        name_pattern = re.compile(r'^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2}$')
+        heading_count = 0
+        for heading in soup.find_all(['h2', 'h3', 'h4']):
+            heading_text = heading.get_text(strip=True)
+            if not heading_text or len(heading_text) > 60:
+                continue
+            if name_pattern.match(heading_text):
+                heading_count += 1
+
+        info['name_heading_count'] = heading_count
+
+        if dominant_count >= 3:
+            estimated_entries = dominant_count
+        elif heading_count >= 3:
+            estimated_entries = heading_count
+        else:
+            estimated_entries = len(anchor_matches)
+
+        info['entry_count'] = estimated_entries
+
+        repeated_blocks = sum(1 for count in parent_counter.values() if count >= 2)
+
+        confidence = 0.0
+        if info['list_keyword_hits'] >= 8:
+            confidence += 0.4
+        elif info['list_keyword_hits'] >= 4:
+            confidence += 0.25
+
+        if dominant_count >= 5:
+            confidence += 0.3
+        elif dominant_count >= 3:
+            confidence += 0.2
+
+        if repeated_blocks >= 3:
+            confidence += 0.2
+        elif repeated_blocks >= 1:
+            confidence += 0.1
+
+        if heading_count >= 5:
+            confidence += 0.2
+        elif heading_count >= 3:
+            confidence += 0.1
+
+        info['confidence'] = min(1.0, confidence)
+        info['is_listing'] = (
+            info['confidence'] >= 0.45 or
+            (info['list_keyword_hits'] >= 6 and dominant_count >= 3)
+        )
+
+    except Exception as exc:
+        logger.debug(f"detect_professor_listing_structure error on {url}: {exc}")
+
+    return info
+
+
 def analyze_page_characteristics(soup: BeautifulSoup, url: str) -> Dict[str, any]:
     """分析页面特征和规模"""
     analysis = {
@@ -1408,47 +1518,58 @@ def analyze_page_characteristics(soup: BeautifulSoup, url: str) -> Dict[str, any
         'estimated_scale': 'medium',
         'has_search_filters': False,
         'total_links': 0,
-        'content_depth': 'shallow'
+        'content_depth': 'shallow',
+        'estimated_professor_count': 0,
+        'professor_listing_confidence': 0.0,
+        'listing_structure_hint': ''
     }
-    
-    # 分析URL路径，判断页面类型 - 扩展支持更多学校
+
+    # 分析URL和页面标题信息
     url_lower = url.lower()
-    
-    # 检查是否为教师/教授页面
-    if any(keyword in url_lower for keyword in ['/faculty', '/people', '/staff', '/directory', '/profiles']):
-        # 进一步细分页面类型
-        if any(dept_keyword in url_lower for dept_keyword in ['department', 'dept', 'division', 'program']):
-            analysis['page_type'] = 'department'  # 系级页面
-        elif any(college_keyword in url_lower for college_keyword in ['college', 'school', 'institute']):
-            analysis['page_type'] = 'college'     # 学院级页面
-        elif 'graduate' in url_lower or 'phd' in url_lower:
-            analysis['page_type'] = 'graduate_faculty'  # 研究生院教师
+    heading_text = ''
+    heading = soup.find('h1') or soup.find('title')
+    if heading:
+        heading_text = heading.get_text(' ', strip=True).lower()
+
+    listing_info = detect_professor_listing_structure(soup, url)
+    analysis['estimated_professor_count'] = listing_info.get('entry_count', 0) or 0
+    analysis['professor_listing_confidence'] = listing_info.get('confidence', 0.0) or 0.0
+    analysis['listing_structure_hint'] = listing_info.get('dominant_structure', '') or ''
+
+    combined_context = f"{url_lower} {heading_text}"
+
+    if listing_info.get('is_listing'):
+        analysis['page_type'] = 'faculty_list'
+
+        department_keywords = ['department', 'dept', 'division', 'program']
+        college_keywords = ['college', 'school', 'institute']
+        graduate_keywords = ['graduate', 'phd', 'doctoral']
+
+        if any(keyword in combined_context for keyword in department_keywords):
+            analysis['page_type'] = 'department'
+        elif any(keyword in combined_context for keyword in college_keywords):
+            analysis['page_type'] = 'college'
+        elif any(keyword in combined_context for keyword in graduate_keywords):
+            analysis['page_type'] = 'graduate_faculty'
+
+        estimated_count = analysis['estimated_professor_count']
+        if estimated_count >= 40:
+            analysis['estimated_scale'] = 'large'
+        elif estimated_count >= 15:
+            analysis['estimated_scale'] = 'medium'
         else:
-            analysis['page_type'] = 'faculty_list'  # 通用教授列表
-    
-    # 特殊检测知名学校页面类型
-    special_patterns = {
-        'steinhardt.nyu.edu': 'nyu_steinhardt',
-        'asc.upenn.edu': 'upenn_annenberg',
-        'seas.upenn.edu': 'upenn_engineering',
-        'wharton.upenn.edu': 'upenn_wharton',
-        'harvard.edu': 'harvard',
-        'mit.edu': 'mit',
-        'stanford.edu': 'stanford',
-        'berkeley.edu': 'uc_berkeley',
-        'columbia.edu': 'columbia'
-    }
-    
-    for pattern, page_type in special_patterns.items():
-        if pattern in url_lower and 'faculty' in url_lower:
-            analysis['page_type'] = page_type
-            analysis['estimated_scale'] = 'large'  # 知名大学通常规模较大
-            break
-    
+            analysis['estimated_scale'] = 'small'
+
+    elif any(keyword in url_lower for keyword in ['/faculty', '/people', '/staff', '/directory', '/profiles']):
+        if any(keyword in combined_context for keyword in ['directory', 'people', 'faculty']):
+            analysis['page_type'] = 'directory'
+        else:
+            analysis['page_type'] = 'information'
+
     # 检测搜索和过滤功能 - 更精确的检测
     search_indicators = soup.find_all(['input', 'select', 'form', 'button'])
-    filter_forms = [elem for elem in search_indicators if 
-                   any(keyword in elem.get('class', []) + [elem.get('id', '')] + [elem.get('name', '')] 
+    filter_forms = [elem for elem in search_indicators if
+                   any(keyword in elem.get('class', []) + [elem.get('id', '')] + [elem.get('name', '')]
                        for keyword in ['search', 'filter', 'sort', 'category', 'department'])]
     analysis['has_search_filters'] = len(filter_forms) > 1
     
@@ -1466,14 +1587,17 @@ def analyze_page_characteristics(soup: BeautifulSoup, url: str) -> Dict[str, any
     
     if content_length > 15000 or professor_mentions > 20:
         analysis['content_depth'] = 'deep'
-        analysis['estimated_scale'] = 'large'
+        if analysis['estimated_professor_count'] < 30:
+            analysis['estimated_scale'] = 'large'
     elif content_length > 5000 or professor_mentions > 10:
         analysis['content_depth'] = 'medium'
+        if analysis['estimated_professor_count'] < 15 and analysis['estimated_scale'] != 'large':
+            analysis['estimated_scale'] = 'medium'
     else:
         analysis['content_depth'] = 'shallow'
-        if analysis['page_type'] != 'unknown':
+        if analysis['page_type'] != 'unknown' and analysis['estimated_professor_count'] < 10:
             analysis['estimated_scale'] = 'small'
-    
+
     return analysis
 
 
@@ -1571,8 +1695,8 @@ def calculate_professor_link_density(soup: BeautifulSoup, url: str) -> float:
 
 
 def generate_parameter_recommendations(
-    page_analysis: Dict, 
-    pagination_info: Dict, 
+    page_analysis: Dict,
+    pagination_info: Dict,
     professor_density: float
 ) -> Dict[str, any]:
     """基于分析结果生成参数推荐"""
@@ -1583,16 +1707,26 @@ def generate_parameter_recommendations(
     reasoning_parts = []
     
     # 1. 根据页面类型调整
+    estimated_professors = page_analysis.get('estimated_professor_count', 0)
+    listing_confidence = page_analysis.get('professor_listing_confidence', 0.0)
+
     if page_analysis['page_type'] == 'department':
         max_links = 20  # 系级页面通常教授较少
         reasoning_parts.append("系级页面，减少链接数")
     elif page_analysis['page_type'] == 'college':
         max_links = 50  # 学院级页面教授较多
         reasoning_parts.append("学院级页面，增加链接数")
-    elif page_analysis['page_type'] == 'nyu_steinhardt':
-        max_links = 60  # NYU Steinhardt页面教授很多
-        reasoning_parts.append("NYU Steinhardt页面，增加链接数以确保覆盖所有教授")
-    
+    elif page_analysis['page_type'] == 'faculty_list':
+        if estimated_professors >= 30:
+            max_links = 60
+            reasoning_parts.append("大型教授列表，放宽链接数以覆盖全部人员")
+        elif estimated_professors >= 15:
+            max_links = max(max_links, 45)
+            reasoning_parts.append("中型教授列表，适度提高链接数")
+        elif listing_confidence >= 0.6:
+            max_links = max(max_links, 35)
+            reasoning_parts.append("高置信度教授列表，确保收集足够链接")
+
     # 2. 根据教授密度调整
     if professor_density > 0.5:  # 极高密度，说明这是专门的教授页面
         max_links = max(max_links, 60)  # 增加链接数，因为几乎都是教授
@@ -1628,7 +1762,7 @@ def generate_parameter_recommendations(
     # 4. 根据页面规模调整
     if page_analysis['total_links'] > 200:
         # 对于学术页面，尤其是教授密度高的页面，不限制链接数
-        if page_analysis['page_type'] in ['nyu_steinhardt', 'faculty_list', 'college'] and professor_density > 0.5:
+        if page_analysis['page_type'] in ['faculty_list', 'college'] and professor_density > 0.5 and listing_confidence >= 0.5:
             reasoning_parts.append("大型学术页面且教授密度高，不限制分析范围")
         else:
             max_links = min(max_links, 40)  # 普通大型页面，控制分析范围
